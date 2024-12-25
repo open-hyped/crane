@@ -1,0 +1,95 @@
+[project]
+name = "crane"
+dynamic = ["version"]
+description = "Lift (process) and place (write) your data streams, seamlessly and in parallel."
+readme = "README.md"
+classifiers = [
+    "License :: Freely Distributable",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+authors = [
+    {name = "open-hyped"},
+]
+requires-python = ">=3.10"
+license = {text = "Apache 2.0"}
+dependencies = [
+    "dill>=0.3.8",
+    "datasets>=3.2.0",
+    "fsspec<=2023.9.2",
+]
+
+[project.optional-dependencies]
+linting = ["pre-commit"]
+tests = [
+    "pytest",
+    "pytest-cov",
+    "pytest-asyncio",
+    "pytest-integration",
+    "sharedmock@git+https://github.com/ScriptingSquirrel/python-sharedmock.git"
+]
+docs = ["sphinx", "furo"]
+
+[build-system]
+requires = ["setuptools >= 61.0.0", "setuptools_scm>=8.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.coverage.run]
+concurrency = ["multiprocessing","thread"]
+parallel = true
+sigterm = true
+data_file = "/tmp/.coverage"
+
+[tool.coverage.report]
+ignore_errors = true
+omit = ["tests/*", "src/crane/__version__.py"]
+# Regexes for lines to exclude from consideration
+exclude_also = [
+    # Don't complain about missing debug-only code:
+    "def __repr__",
+    "if self\\.debug",
+
+    # Don't complain if tests don't hit defensive assertion code:
+    "raise AssertionError",
+    "raise NotImplementedError",
+
+    # Don't complain if non-runnable code isn't run:
+    "if 0:",
+    "if __name__ == .__main__.:",
+
+    # Don't complain about abstract methods, they aren't run:
+    "@(abc\\.)?abstractmethod",
+
+    # Don't complain about overloaded functions
+    "@(typing\\.)?overload",
+    "pragma: not covered"
+]
+
+[tool.setuptools_scm]
+version_file = "src/crane/__version__.py"
+
+[tool.black]
+target-version = ["py310"]
+line-length = 100
+docstring-style = "google"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = ["docs/source/conf.py"]
+
+[tool.ruff]
+line-length = 100
+ignore = ["E741", "B028", "B006", "B008", "B023"]
+select = ["D", "E", "F", "W", "N", "B", "T"]
+
+[tool.ruff.pydocstyle]
+convention = "google"
+
+[tool.ruff.per-file-ignores]
+# Don't check docstrings of `tests` and `docs`
+#"tests/**" = ["D"]
+"docs/**" = ["D"]
+"tests/**" = ["D", "E", "F", "W", "N", "B", "T"]  # TODO: temporary
