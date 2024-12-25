@@ -1,4 +1,5 @@
-# Hyped Crane
+# 🏗️ Hyped Crane
+
 
 [![Tests](https://github.com/open-hyped/crane/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/open-hyped/crane/actions/workflows/tests.yml)
 [![Linting](https://github.com/open-hyped/crane/actions/workflows/linting.yml/badge.svg?branch=main)](https://github.com/open-hyped/crane/actions/workflows/linting.yml)
