@@ -34,9 +34,6 @@ jobs:
 
   publish-to-pypi:
     name: Publish Python 🐍 distribution 📦 to PyPI
-    if: >
-      github.ref_type == 'tag' &&
-      matches(github.ref, '^refs/tags/v\d+\.\d+\.\d+$')
     needs:
     - build
     runs-on: ubuntu-latest
