@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+arrow = ["pyarrow>=17.0.0"]
 linting = ["pre-commit"]
 tests = [
     "pytest",
