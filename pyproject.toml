@@ -1,5 +1,5 @@
 [project]
-name = "crane"
+name = "hyped-crane"
 dynamic = ["version"]
 description = "Lift (process) and place (write) data streams, seamlessly and in parallel."
 readme = "README.md"
