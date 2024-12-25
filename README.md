@@ -62,8 +62,11 @@ Transformations on iterable datasets are applied lazily. That means the data isn
 
 ```python
 # Apply a transformation to compute the maximum of list "b"
-ds = ds.map(lambda x: {"max(b)": max(x["b"])})
+features = datasets.Features(ds.features | {"max(b)": ds.features["b"].feature})
+ds = ds.map(lambda x: {"max(b)": max(x["b"])}, features=features)
 ```
+
+**Note**: Some writers, including the `ArrowDatasetWriter`, require the dataset features to be well defined.
 
 ### Step 3: Write the Dataset to Disk
 
