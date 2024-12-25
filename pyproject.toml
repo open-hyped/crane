@@ -1,7 +1,7 @@
 [project]
 name = "crane"
 dynamic = ["version"]
-description = "Lift (process) and place (write) your data streams, seamlessly and in parallel."
+description = "Lift (process) and place (write) data streams, seamlessly and in parallel."
 readme = "README.md"
 classifiers = [
     "License :: Freely Distributable",
@@ -17,6 +17,7 @@ requires-python = ">=3.10"
 license = {text = "Apache 2.0"}
 dependencies = [
     "dill>=0.3.8",
+    "orjson>=3.10.1",
     "datasets>=3.2.0",
     "fsspec<=2023.9.2",
 ]
