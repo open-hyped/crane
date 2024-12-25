@@ -1,6 +1,10 @@
 name: Publish Python 🐍 distribution 📦 to PyPI and TestPyPI
 
-on: push
+on:
+  push:
+    pull_request:
+      branches: 
+        - main
 
 jobs:
   build:
@@ -51,5 +55,5 @@ jobs:
     - name: Publish distribution 📦 to TestPyPI
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
-        password: ${{ secrets.TEST_PYPI_API_TOKEN }}
         repository-url: https://test.pypi.org/legacy/
+        # password: ${{ secrets.TEST_PYPI_API_TOKEN }}
