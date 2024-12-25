@@ -4,7 +4,6 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 from datasets import Dataset
-from sharedmock.mock import SharedMock
 
 from crane.core.callbacks.base import CallbackManager
 from crane.core.runners.base import WorkerProcessingStage, WorkerRole
@@ -16,6 +15,7 @@ from crane.core.runners.multi_process_runner import (
     Worker,
     WorkerContext,
 )
+from tests.third_party.sharedmock.mock import SharedMock
 
 
 class TestWorker:

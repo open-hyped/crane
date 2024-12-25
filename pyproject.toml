@@ -30,7 +30,6 @@ tests = [
     "pytest-cov",
     "pytest-asyncio",
     "pytest-integration",
-    "sharedmock@git+https://github.com/ScriptingSquirrel/python-sharedmock.git"
 ]
 docs = ["sphinx", "furo"]
 
