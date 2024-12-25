@@ -3,6 +3,15 @@
 Lift (process) and place (write) data streams, seamlessly and in parallel.
 """
 
+from .__version__ import __version__, __version_tuple__  # noqa: F401
+
+# isort: off
+# keep logging setup at beginning of the file
+# to run the setup hook first
+from .logging.setup import setup_logging
+
+# isort: on
+
 __all__ = [
     "Callback",
     "DatasetConsumer",
@@ -16,7 +25,6 @@ __all__ = [
 from typing import TYPE_CHECKING
 
 from .core import Callback, DatasetConsumer, ShardingStrategy, TqdmReporterCallback
-from .logging.setup import setup_logging
 
 if TYPE_CHECKING:
     from .arrow import ArrowDatasetWriter
