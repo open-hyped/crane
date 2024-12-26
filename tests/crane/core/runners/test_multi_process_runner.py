@@ -11,7 +11,6 @@ from crane.core.runners.multi_process_runner import (
     ConsumerProducerBalancer,
     DynamicMultiprocessingRunner,
     MessageType,
-    Serializer,
     Worker,
     WorkerContext,
 )
@@ -33,15 +32,26 @@ class TestWorker:
 
     @pytest.fixture
     def transform(self):
-        return MagicMock()
+        return MagicMock(side_effect=lambda x: x)
 
     @pytest.fixture
-    def context(self, transform):
+    def data_stream(self):
+        dummy_data = [
+            {"a": 0, "b": [1, 2, 3, 4]},
+            {"a": 1, "b": [5, 6]},
+            {"a": 1, "b": [7, 8, 9, 10]},
+        ]
+        ds = Dataset.from_list(dummy_data)
+        ds = ds.to_iterable_dataset(3)
+        return ds._ex_iterable
+
+    @pytest.fixture
+    def context(self, data_stream, transform):
         return WorkerContext(
             role=WorkerRole.STANDALONE,
-            data_stream=[MagicMock(), MagicMock(), MagicMock()],
-            data_transform=lambda x: map(transform, x),
-            data_finalizer=MagicMock(),
+            data_stream=data_stream,
+            data_transform=transform,
+            data_finalizer=MagicMock(return_value=None),
             stop=False,
         )
 
@@ -89,7 +99,7 @@ class TestWorker:
         assert worker._ctx == ctx
 
     @patch("crane.core.runners.multi_process_runner.set_worker_info")
-    def test_run(self, mock_set_worker_info, worker, transform):
+    def test_run(self, mock_set_worker_info, worker, data_stream, transform):
         # mock request new context
         worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
         # run worker
@@ -97,14 +107,15 @@ class TestWorker:
 
         mock_set_worker_info.assert_called_once()
         # make sure all samples have been processed
+        transform.assert_called_once()
         worker._ctx.data_finalizer.assert_has_calls(
-            [call(transform(x)) for x in worker._ctx.data_stream], any_order=True
+            [call(x) for _, x in data_stream], any_order=True
         )
         worker._worker_init.assert_called_once()
         worker._worker_finalize.assert_called_once()
 
     @patch("crane.core.runners.multi_process_runner.set_worker_info")
-    def test_run_with_ctx_update(self, mock_set_worker_info, worker, transform):
+    def test_run_with_ctx_update(self, mock_set_worker_info, worker, data_stream, transform):
         # mock request new and check context
         worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
         # mock context connection
@@ -118,15 +129,16 @@ class TestWorker:
 
         mock_set_worker_info.assert_called_once()
         # make sure all samples have been processed
+        transform.assert_called()
         assert len(worker._recv_ctx.mock_calls) == 3
         worker._ctx.data_finalizer.assert_has_calls(
-            [call(transform(x)) for x in worker._ctx.data_stream], any_order=True
+            [call(x) for _, x in data_stream], any_order=True
         )
         worker._worker_init.assert_called_once()
         worker._worker_finalize.assert_called_once()
 
     @patch("crane.core.runners.multi_process_runner.set_worker_info")
-    def test_run_with_abort(self, mock_set_worker_info, worker, transform):
+    def test_run_with_abort(self, mock_set_worker_info, worker, data_stream, transform):
         # mock request new and check context
         worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
         # mock context connection
@@ -138,11 +150,12 @@ class TestWorker:
 
         worker.run()
 
+        transform.assert_called_once()
         mock_set_worker_info.assert_called_once()
         # make sure all samples have been processed
         assert len(worker._recv_ctx.mock_calls) == 1
         worker._ctx.data_finalizer.assert_has_calls(
-            [call(transform(worker._ctx.data_stream[0]))], any_order=True
+            [call({"a": 0, "b": [1, 2, 3, 4]})], any_order=True
         )
 
     @patch("crane.core.runners.multi_process_runner.set_worker_info")
@@ -173,19 +186,6 @@ class TestWorker:
         worker.run()
         # make sure errors were logged
         assert len(worker._logger.error.mock_calls) == 2
-
-
-class TestSerializer:
-    def test_serialization_deserialization(self):
-        serializer = Serializer(batch_size=5)
-        samples = [{"key": i} for i in range(32)]
-
-        # Serialize and deserialize the samples
-        serialized = list(serializer.serialize(samples))
-        deserialized = list(serializer.deserialize(serialized))
-
-        # Check that the deserialized output matches the original samples
-        assert deserialized == samples, "Deserialized output does not match the original samples"
 
 
 class TestConsumerProducerBalancer(object):
@@ -298,10 +298,7 @@ class TestDynamicMultiprocessingRunner:
 
         src_ex_it, pipeline = runner._prepare_dataset(mapped_ds)
 
-        # check output
-        assert isinstance(src_ex_it, type(ds._ex_iterable))
-
         # test pipeline output
-        expected = list(pipeline(src_ex_it))
+        expected = [v for _, v in pipeline(src_ex_it)]
         actual = list(mapped_ds)
         assert actual == expected

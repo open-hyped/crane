@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import crane.core.utils
-from crane.core.utils import EMA, Compose, RunAll, TimeWeightedEMA, chdir, ith_entries
+from crane.core.utils import EMA, Compose, RunAll, TimeWeightedEMA, chdir
 
 
 def test_chdir() -> None:
@@ -36,27 +36,6 @@ def test_chdir_exception() -> None:
 
         # After exiting the context, should be back to temp_dir1
         assert os.getcwd().endswith(os.path.abspath(orig_dir))
-
-
-@patch("crane.core.utils.is_python_version_less_than", return_value=(3, 11))
-def test_batched(mock_is_python_version_less_than: MagicMock) -> None:
-    # reload module to make sure to use the <3.12 implementation
-    importlib.reload(crane.core.utils)
-    from crane.core.utils import batched
-
-    # check batches
-    assert list(batched(range(100), 10)) == [tuple(range(i, i + 10)) for i in range(0, 100, 10)]
-
-    # batch size to small
-    with pytest.raises(ValueError):
-        next(batched(range(10), 0))
-
-
-def test_ith_entries() -> None:
-    it = [(i, i + 1) for i in range(10)]
-
-    assert list(ith_entries(it, 0)) == list(range(10))
-    assert list(ith_entries(it, 1)) == list(range(1, 11))
 
 
 def test_compose() -> None:

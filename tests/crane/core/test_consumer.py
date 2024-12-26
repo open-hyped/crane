@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from datasets import IterableDataset
 
@@ -13,16 +13,20 @@ class TestDatasetConsumer(unittest.TestCase):
         # Create a mock dataset
         mock_dataset = MagicMock(spec=IterableDataset)
 
+        # create mock finalizer setup
+        mock_finalizer = MagicMock()
+        mock_batch_size = MagicMock()
+        mock_formatting = MagicMock()
+
         # Mock initialization and finalization functions
         mock_initialize = MagicMock()
         mock_finalize = MagicMock()
 
         # Create the dataset consumer with a single process
         consumer = DatasetConsumer(
-            fn=lambda x: x,
             num_proc=1,  # Single process mode
-            initialize=mock_initialize,
-            finalize=mock_finalize,
+            on_start=mock_initialize,
+            on_finish=mock_finalize,
             disable_tqdm=False,
         )
 
@@ -31,19 +35,21 @@ class TestDatasetConsumer(unittest.TestCase):
         mock_runner_instance.run = MagicMock()
 
         # Call the consumer
-        consumer.consume(mock_dataset)
+        consumer.consume(mock_dataset, mock_finalizer, mock_batch_size, mock_formatting)
 
         # Ensure the MainProcessRunner was created
         mock_main_runner.assert_called_once_with(
             batch_size=consumer._prefetch,
-            initialize=mock_initialize,
-            finalize=mock_finalize,
+            env_init=mock_initialize,
+            env_finalize=mock_finalize,
             progress_report_interval=consumer._report_interval,
             callback=consumer._callback,
         )
 
         # Ensure the run method was called with the dataset and function
-        mock_runner_instance.run.assert_called_once_with(mock_dataset, consumer._fn)
+        mock_runner_instance.run.assert_called_once_with(
+            mock_dataset, mock_finalizer, mock_batch_size, mock_formatting
+        )
 
         # Ensure the DynamicMultiprocessingRunner was not called
         mock_dynamic_runner.assert_not_called()
@@ -54,16 +60,20 @@ class TestDatasetConsumer(unittest.TestCase):
         # Create a mock dataset
         mock_dataset = MagicMock(spec=IterableDataset)
 
+        # create mock finalizer setup
+        mock_finalizer = MagicMock()
+        mock_batch_size = MagicMock()
+        mock_formatting = MagicMock()
+
         # Mock initialization and finalization functions
         mock_initialize = MagicMock()
         mock_finalize = MagicMock()
 
         # Create the dataset consumer with multiple processes
         consumer = DatasetConsumer(
-            fn=lambda x: x,
             num_proc=4,  # Multi-process mode
-            initialize=mock_initialize,
-            finalize=mock_finalize,
+            on_start=mock_initialize,
+            on_finish=mock_finalize,
             disable_tqdm=False,
         )
 
@@ -72,7 +82,7 @@ class TestDatasetConsumer(unittest.TestCase):
         mock_runner_instance.run = MagicMock()
 
         # Call the consumer
-        consumer.consume(mock_dataset)
+        consumer.consume(mock_dataset, mock_finalizer, mock_batch_size, mock_formatting)
 
         # Ensure the DynamicMultiprocessingRunner was created
         mock_dynamic_runner.assert_called_once_with(
@@ -85,7 +95,9 @@ class TestDatasetConsumer(unittest.TestCase):
         )
 
         # Ensure the run method was called with the dataset and function
-        mock_runner_instance.run.assert_called_once_with(mock_dataset, consumer._fn)
+        mock_runner_instance.run.assert_called_once_with(
+            mock_dataset, mock_finalizer, mock_batch_size, mock_formatting
+        )
 
         # Ensure the MainProcessRunner was not called
         mock_main_runner.assert_not_called()
@@ -94,7 +106,6 @@ class TestDatasetConsumer(unittest.TestCase):
     def test_tqdm_callback_added(self, tqdm_reporter_cls):
         # Create the dataset consumer with disable_tqdm=False (tqdm should be enabled)
         consumer = DatasetConsumer(
-            fn=lambda x: x,
             num_proc=1,  # Single process mode
             disable_tqdm=True,  # Tqdm should be enabled
         )
@@ -104,7 +115,6 @@ class TestDatasetConsumer(unittest.TestCase):
 
         # Create the dataset consumer with disable_tqdm=False (tqdm should be enabled)
         consumer = DatasetConsumer(
-            fn=lambda x: x,
             num_proc=1,  # Single process mode
             disable_tqdm=False,  # Tqdm should be enabled
         )

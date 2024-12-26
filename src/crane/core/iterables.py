@@ -194,12 +194,11 @@ class TimedExamplesIterable(BaseExamplesIterable):
             Tuple[str, pa.Table]: A tuple containing the key and the next Arrow table.
                 Returns None if the underlying iterable's :code:`iter_arrow` returns None.
         """
-        it = self.ex_iterable.iter_arrow()
-        if it is None:
+        if self.ex_iterable.iter_arrow is None:
             return None
 
         st = clock()
-        for key, pa_table in it:
+        for key, pa_table in self.ex_iterable.iter_arrow():
             # get new time and compute time delta
             nt = clock()
             dt = nt - st

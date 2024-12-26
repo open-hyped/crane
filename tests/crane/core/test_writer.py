@@ -1,5 +1,5 @@
 import os
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import datasets
 import pytest
@@ -38,26 +38,26 @@ class TestBaseDatasetWriter:
 
             # check dataset consumer
             consumer_mock.assert_called_once()
-            consumer_mock().consume.assert_called_once_with(ds)
-            # get arguments to consumer initializer
-            fn = consumer_mock.mock_calls[0].args[0]
-            init = consumer_mock.mock_calls[0].kwargs["initialize"]
-            finalize = consumer_mock.mock_calls[0].kwargs["finalize"]
+            consumer_mock().consume.assert_called_once_with(
+                ds, finalizer=ANY, batch_size=1, formatting="arrow"
+            )
 
-            # avoid buffer clear because clearing is inplace and mock call arguments
-            # would be cleared too
-            with patch("crane.core.writer.BatchBuffer.clear", MagicMock()):
-                mock_sample = MagicMock()
-                # apply function
-                fn(mock_sample)
-                # make sure that the callback is called first, then the write sample
-                # and finally the update function
-                if with_sharding:
-                    sharding_mock().callback.assert_called_once_with([mock_sample])
-                    writer.write_batch.assert_called_once_with(sharding_mock().callback())
-                    sharding_mock().update(writer.write_batch())
-                else:
-                    writer.write_batch.assert_called_once_with([mock_sample])
+            # get arguments to consumer initializer
+            fn = consumer_mock().consume.mock_calls[0].kwargs["finalizer"]
+            init = consumer_mock.mock_calls[0].kwargs["on_start"]
+            finalize = consumer_mock.mock_calls[0].kwargs["on_finish"]
+
+            # apply function
+            mock_batch = MagicMock()
+            fn(mock_batch)
+            # make sure that the callback is called first, then the write sample
+            # and finally the update function
+            if with_sharding:
+                sharding_mock().callback.assert_called_once_with(mock_batch)
+                writer.write_batch.assert_called_once_with(sharding_mock().callback())
+                sharding_mock().update(writer.write_batch())
+            else:
+                writer.write_batch.assert_called_once_with(mock_batch)
 
             # make sure the sharding initializers is called
             init()

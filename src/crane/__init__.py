@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 from .core import Callback, DatasetConsumer, ShardingStrategy, TqdmReporterCallback
 
-if TYPE_CHECKING:
+if TYPE_CHECKING:  # pragma: not covered
     from .arrow import ArrowDatasetWriter
     from .json import JsonDatasetWriter
 

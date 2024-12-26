@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def _do_nothing():
     """A no-operation function that returns nothing."""
-    return
+    return  # pragma: not covered
 
 
 class DatasetConsumer(object):

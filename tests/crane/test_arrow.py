@@ -1,6 +1,6 @@
 from datasets import Dataset, DatasetDict, load_from_disk
 
-from crane.arrow import ArrowDatasetWriter
+from crane import ArrowDatasetWriter
 
 from .base import BaseTestDatasetWriter
 

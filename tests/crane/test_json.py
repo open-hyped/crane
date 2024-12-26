@@ -3,7 +3,7 @@ import os
 
 from datasets import Dataset
 
-from crane.json import JsonDatasetWriter
+from crane import JsonDatasetWriter
 
 from .base import BaseTestDatasetWriter
 

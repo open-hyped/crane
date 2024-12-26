@@ -357,7 +357,7 @@ class ProgressMonitor(object):
                 qsize = self._queue.qsize() * self._item_size
                 self._ema_queue_size.update(clock(), qsize)
 
-        except (BrokenPipeError, ConnectionResetError):  # pragme: not covered
+        except (BrokenPipeError, ConnectionResetError):  # pragma: not covered
             # queue connection closed
             return
 
