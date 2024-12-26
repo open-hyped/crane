@@ -108,14 +108,11 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         Yields:
             tuple[key, Sample]: A tuple containing a key and the formatted example.
         """
-        if self._flag:
-            return
-
         if self._iter is None:
             self.init_iter()
 
         formatter = PythonFormatter()
-        for key, pa_table in self._iter:
+        for key, pa_table in self._iter_arrow():
             for i, item in enumerate(pa_table.to_reader(max_chunksize=1)):
                 yield f"{key}_{i}", formatter.format_row(item)
             if self._flag:

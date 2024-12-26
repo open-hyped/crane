@@ -107,8 +107,8 @@ class DatasetConsumer(object):
             # create the main process runner and run it
             runner = MainProcessRunner(
                 batch_size=self._prefetch,
-                initialize_workspace=self._on_start,
-                finalize_workspace=self._on_finish,
+                env_init=self._on_start,
+                env_finalize=self._on_finish,
                 progress_report_interval=self._report_interval,
                 callback=self._callback,
             )
