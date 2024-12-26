@@ -16,8 +16,6 @@ from typing import Any, Callable
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .utils import Sample
-
 logger = logging.getLogger(__name__)
 
 
@@ -206,14 +204,14 @@ class ShardingController(object):
         self._shard_bytes = 0
         self._sample_size = 0
 
-    def callback(self, batch: pa.Table) -> Sample:
+    def callback(self, batch: pa.Table) -> pa.Table:
         """Process each batch before writing and check if a new shard is required.
 
         Args:
             batch (pa.Table): The batch of samples.
 
         Returns:
-            [Sample]: The batch, unchanged.
+            pa.Table: The batch, unchanged.
         """
         if self._sharding_strategy is ShardingStrategy.SAMPLE_ITEM:
             # cache the size of the sample to be used later in the shard size update

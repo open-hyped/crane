@@ -10,7 +10,7 @@ import pyarrow as pa
 from datasets.formatting import PythonFormatter
 from datasets.iterable_dataset import _BaseExamplesIterable
 
-from .utils import EMA, Sample, clock
+from .utils import EMA, clock
 
 
 class BaseExamplesIterable(_BaseExamplesIterable):
@@ -25,7 +25,7 @@ class BaseExamplesIterable(_BaseExamplesIterable):
         super(BaseExamplesIterable, self).__init__()
         self.ex_iterable = ex_iterable
 
-    def __iter__(self) -> Iterable[tuple[str, Sample]]:
+    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
         """Iterate over the examples.
 
         Raises:
@@ -102,11 +102,11 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         """Resume the iteration."""
         self._flag = False
 
-    def __iter__(self) -> Iterable[tuple[str, Sample]]:
+    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
         """Iterate over the examples.
 
         Yields:
-            tuple[key, Sample]: A tuple containing a key and the formatted example.
+            tuple[key, dict[str, Any]]: A tuple containing a key and the formatted example.
         """
         if self._iter is None:
             self.init_iter()
@@ -168,11 +168,11 @@ class TimedExamplesIterable(BaseExamplesIterable):
         """Returns the total processing time spent iterating over the entire dataset."""
         return self.total
 
-    def __iter__(self) -> Iterable[tuple[str, Sample]]:
+    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
         """Iterate over the examples, tracking and updating processing time statistics.
 
         Yields:
-            Tuple[str, Sample]: A tuple containing the key and the next item from the
+            Tuple[str, dict[str, Any]]: A tuple containing the key and the next item from the
                 underlying iterable.
         """
         st = clock()
@@ -229,7 +229,7 @@ class PreQueueExamplesIterable(BaseExamplesIterable):
         super().__init__(ex_iterable)
         self.key = key
 
-    def __iter__(self) -> Iterable[tuple[str, Sample]]:
+    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
         """Iterate over the examples.
 
         Raises:
@@ -300,11 +300,11 @@ class QueueExamplesIterable(BaseExamplesIterable):
         self.timeout = timeout
         self.n_shards = num_shards
 
-    def __iter__(self) -> Iterable[tuple[str, Sample]]:
+    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
         """Iterate over the examples retrieved from the queue.
 
         Yields:
-            Tuple[str, Sample]: A tuple containing the key and the formatted example.
+            Tuple[str, dict[str, Any]]: A tuple containing the key and the formatted example.
         """
         formatter = PythonFormatter()
         for key, pa_table in self._iter_arrow():
