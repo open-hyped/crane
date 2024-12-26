@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock
 
+import pyarrow as pa
 import pytest
 
 from crane.core.sharding import ShardingController, ShardingStrategy, _parse_size
@@ -190,15 +191,17 @@ class TestShardingController:
         initialize_shard.reset_mock()
         finalize_shard.reset_mock()
 
+        batch = pa.table({"key": [42]})
+
         for _ in range(max_shard_size // 42 + 1):
-            controller.callback([{"key": 42}])
+            controller.callback(batch)
             controller.update(1)
             # no new shard needed to be generated yet
             assert not finalize_shard.called
             assert not initialize_shard.called
 
         # this update should kick of a new shard
-        controller.callback([{"key": 42}])
+        controller.callback(batch)
         controller.update(1)
 
         finalize_shard.assert_called_once()

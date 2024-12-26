@@ -18,10 +18,10 @@ dependencies = [
     "orjson>=3.10.1",
     "datasets>=3.2.0",
     "fsspec<=2023.9.2",
+    "pyarrow>=17.0.0"
 ]
 
 [project.optional-dependencies]
-arrow = ["pyarrow>=17.0.0"]
 linting = ["pre-commit"]
 tests = [
     "pytest",

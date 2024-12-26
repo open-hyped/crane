@@ -11,8 +11,6 @@ from typing import Any, Callable
 
 from datasets import IterableDataset
 
-from ..utils import Sample
-
 
 class WorkerRole(str, Enum):
     """Enumeration of different roles a worker can assume during multiprocessing.
@@ -67,11 +65,22 @@ class BaseRunner(ABC):
     """
 
     @abstractmethod
-    def run(self, ds: IterableDataset, fn: Callable[[Sample], Any]) -> None:
+    def run(
+        self,
+        ds: IterableDataset,
+        finalizer: Callable[[Any], Any],
+        batch_size: None | int = None,
+        formatting: None | str = None,
+    ) -> None:
         """Execute data processing on the given dataset.
 
         Args:
             ds (IterableDataset): The dataset to process.
-            fn (Callable[[Sample], Any]): The function to apply to each sample in the dataset.
+            finalizer (Callable[[Any], Any]): The function to apply to each sample or batch
+                of samples in the dataset as the final processing step.
+            batch_size (None | int): The size of each batch to process. If :code:`None`,
+                process samples individually. Only affects the finalizer. Defaults to None.
+            formatting (None | str): The data format in which samples or batches are provided
+                to the finalizer function.
         """
         ...

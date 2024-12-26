@@ -30,8 +30,8 @@ class TestMainProcessRunner:
     def runner(self):
         return MainProcessRunner(
             batch_size=1,
-            initialize=MagicMock(),
-            finalize=MagicMock(),
+            env_init=MagicMock(),
+            env_finalize=MagicMock(),
             progress_report_interval=0.0,
             callback=CallbackManager([]),
         )

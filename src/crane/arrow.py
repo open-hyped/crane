@@ -8,7 +8,6 @@ import pyarrow as pa
 from datasets import DatasetInfo
 
 from .core import BaseDatasetWriter
-from .core.utils import Sample
 from .core.worker import get_worker_info
 
 
@@ -58,14 +57,14 @@ class ArrowDatasetWriter(BaseDatasetWriter):
             sink=worker_info.ctx.file, schema=worker_info.ctx.schema
         )
 
-    def write_batch(self, batch: list[Sample]) -> int:
+    def write_batch(self, batch: pa.Table) -> int:
         """Write a batch of samples to the Arrow shard.
 
         This method writes the samples as a record batch to the worker's shard file
         using the Arrow schema initialized during the :code:`initialize` phase.
 
         Args:
-            batch (list[Sample]): A list of samples to be written to the Arrow file.
+            batch (pa.Table): A list of samples to be written to the Arrow file.
 
         Returns:
             int: The number of bytes written to the shard.
@@ -73,8 +72,7 @@ class ArrowDatasetWriter(BaseDatasetWriter):
         info = get_worker_info()
         file_size = info.ctx.file.tell()
         # write sample to file
-        batch = pa.RecordBatch.from_pylist(batch, schema=info.ctx.schema)
-        info.ctx.writer.write(batch)
+        info.ctx.writer.write(batch.cast(info.ctx.schema))
         # return bytes written to file
         return info.ctx.file.tell() - file_size
 

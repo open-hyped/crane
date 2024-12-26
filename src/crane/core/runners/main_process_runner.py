@@ -10,11 +10,12 @@ through callbacks.
 import logging
 from typing import Any, Callable, TypeAlias
 
-from datasets import IterableDataset
+from datasets.iterable_dataset import FormattingConfig, IterableDataset
 
 from ..callbacks.base import CallbackManager
+from ..iterables import TimedExamplesIterable
 from ..monitor import ProgressMonitor, ProgressReport
-from ..utils import Sample, TimedIterator, clock, ith_entries
+from ..utils import clock
 from ..worker import reset_worker_info, set_worker_info
 from .base import BaseRunner, WorkerProcessingStage, WorkerRole
 
@@ -34,8 +35,8 @@ class MainProcessRunner(BaseRunner):
     def __init__(
         self,
         batch_size: int,
-        initialize: Callable[[], Any],
-        finalize: Callable[[], Any],
+        env_init: Callable[[], Any],
+        env_finalize: Callable[[], Any],
         progress_report_interval: float,
         callback: CallbackManager,
     ) -> None:
@@ -43,20 +44,26 @@ class MainProcessRunner(BaseRunner):
 
         Args:
             batch_size (int): The number of samples to process in each batch.
-            initialize (Callable[[], Any]): Function to initialize the processing environment.
-            finalize (Callable[[], Any]): Function to finalize the processing environment.
+            env_init (Callable[[], Any]): Function to initialize the processing environment.
+            env_finalize (Callable[[], Any]): Function to finalize the processing environment.
             progress_report_interval (float): The time interval, in seconds, between sending
                 progress updates.
             callback (CallbackManager): A callback manager that will be invoked at various points
                 during the data processing lifecycle.
         """
         self._batch_size = batch_size
-        self._initialize = initialize
-        self._finalize = finalize
+        self._env_init = env_init
+        self._env_finalize = env_finalize
         self._report_interval = progress_report_interval
         self._callback = callback
 
-    def run(self, ds: IterableDataset, fn: Callable[[Sample], Any]) -> None:
+    def run(
+        self,
+        ds: IterableDataset,
+        finalizer: Callable[[Any], Any],
+        batch_size: None | int = None,
+        formatting: None | str = None,
+    ) -> None:
         """Execute data processing on the dataset.
 
         This method prepares the dataset, initializes the processing environment, and processes
@@ -66,7 +73,12 @@ class MainProcessRunner(BaseRunner):
 
         Args:
             ds (IterableDataset): The dataset to process.
-            fn (Callable[[Sample], Any]): The function to apply to each sample in the dataset.
+            finalizer (Callable[[Any], Any]): The function to apply to each sample or batch
+                of samples in the dataset as the final processing step.
+            batch_size (None | int): The size of each batch to process. If :code:`None`,
+                process samples individually. Only affects the finalizer. Defaults to None.
+            formatting (None | str): The data format in which samples or batches are provided
+                to the finalizer function.
         """
         logger.info("Preparing to run data processing on dataset.")
 
@@ -86,7 +98,7 @@ class MainProcessRunner(BaseRunner):
             self._callback.on_start(monitor, ds)
 
             # initialize the consumer
-            self._initialize()
+            self._env_init()
             logger.info("Initialization complete.")
 
             monitor._mark_worker_ready(0)
@@ -103,11 +115,26 @@ class MainProcessRunner(BaseRunner):
 
                     # get the dataset shard and time it
                     shard = ds.shard_data_sources(num_shards, shard_id)
-                    stream = TimedIterator(iter(shard), smoothing=0.1)
+                    stream = TimedExamplesIterable(shard, smoothing=0.1)
 
                     # apply the function
-                    work_iterator = map(fn, ith_entries(stream, i=1))
-                    work_iterator = TimedIterator(iter(work_iterator), smoothing=0.1)
+                    work_iterator = (
+                        IterableDataset(
+                            ex_iterable=stream,
+                            formatting=(
+                                None
+                                if formatting is None
+                                else FormattingConfig(format_type=formatting)
+                            ),
+                        )
+                        .map(
+                            lambda data: (finalizer(data) or data),
+                            batched=batch_size is not None,
+                            batch_size=batch_size or 1,
+                        )
+                        ._ex_iterable
+                    )
+                    work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
 
                     # main worker loop
                     for _ in work_iterator:
@@ -176,7 +203,7 @@ class MainProcessRunner(BaseRunner):
 
             try:
                 # finalize the consumer
-                self._finalize()
+                self._env_finalize()
                 logger.info("Worker finalized successfully.")
             except Exception as e:  # pragma: not covered
                 logger.error(f"Error during worker finalization: {e}", exc_info=True)
