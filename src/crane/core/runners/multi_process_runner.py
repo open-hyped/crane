@@ -18,48 +18,43 @@ import logging
 import multiprocessing as mp
 import multiprocessing.connection  # noqa: F401
 import traceback
-from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from itertools import chain
-from typing import Any, Callable, Generic, Iterable, TypeAlias, TypeVar
+from typing import Any, Callable, Iterable, TypeAlias, TypeVar
 
 import dill
 import orjson
+import pyarrow as pa
 from datasets import IterableDataset
 from datasets.iterable_dataset import (
     FilteredExamplesIterable,
+    FormattingConfig,
     MappedExamplesIterable,
+    RebatchedArrowExamplesIterable,
     TypedExamplesIterable,
     _BaseExamplesIterable,
+    identity_func,
 )
 
 from ..callbacks.base import CallbackManager
-from ..monitor import ProgressMonitor, ProgressReport
-from ..utils import (
-    Compose,
-    QueueIterator,
-    Sample,
-    StoppableIterator,
-    TimedIterator,
-    batched,
-    clock,
-    ith_entries,
+from ..iterables import (
+    ExamplesIterablePipeline,
+    QueueExamplesIterable,
+    StoppableExamplesIterable,
+    TimedExamplesIterable,
 )
+from ..monitor import ProgressMonitor, ProgressReport
+from ..utils import clock
 from ..worker import set_worker_info
 from .base import BaseRunner, WorkerProcessingStage, WorkerRole
 
 # shorthands and helper type aliases
 Stages: TypeAlias = WorkerProcessingStage
-IndexedSample: TypeAlias = tuple[str, Sample]
-
-T = TypeVar("T")
-U = TypeVar("U")
 
 
 @dataclass
-class WorkerContext(Generic[T, U]):
+class WorkerContext:
     """Dataclass representing the context passed to workers.
 
     This class defines the context used for setting up a worker's role, data stream,
@@ -71,23 +66,33 @@ class WorkerContext(Generic[T, U]):
     unchanged.
     """
 
-    data_stream: None | Iterable[T] = None
+    data_stream: None | _BaseExamplesIterable = None
     """An iterable providing the stream of data items that the worker will process."""
 
-    data_transform: None | Callable[[Iterable[T]], Iterable[U]] = None
+    data_transform: None | Callable[[_BaseExamplesIterable], _BaseExamplesIterable] = None
     """A function that wraps the data stream and applies workload on each sample, returning an
     iterable of processed data.
     """
 
-    data_finalizer: None | Callable[[U], Any] = None
+    data_finalizer: None | Callable[[Any], Any] = None
     """A function that applies final processing to each transformed data item, or None if no
     finalization is needed.
     """
 
+    data_finalizer_batch_size: None | int = None
+    """The size of each batch to process for the :code:`data_finalizer` function.
+
+    If None, the :code:`data_finalizer` will receive individual samples.
+    Otherwise, the :code:`data_finalizer` will receive batches of this size.
+    """
+
+    data_finalizer_formatting: None | FormattingConfig = None
+    """The data format expected by the data finalizer."""
+
     stop: bool = False
     """A flag indicating whether the worker should stop processing."""
 
-    def apply_ctx(self, other: "WorkerContext[T, U]") -> None:
+    def apply_ctx(self, other: WorkerContext) -> None:
         """Applies non-None values of a given context to self.
 
         Updates the current context's attributes with the values from another WorkerContext.
@@ -104,68 +109,13 @@ class WorkerContext(Generic[T, U]):
             self.data_transform = other.data_transform
         if other.data_finalizer is not None:
             self.data_finalizer = other.data_finalizer
+            self.data_finalizer_batch_size = other.data_finalizer_batch_size
+            self.data_finalizer_formatting = other.data_finalizer_formatting
         self.stop = other.stop
 
     def __str__(self) -> str:
         """Returns a string representation of the WorkerContext, including the worker role."""
         return f"WorkerContext(worker_role={self.role})"
-
-
-class ExamplesIterablePipeline(list[_BaseExamplesIterable]):
-    """Pipeline of huggingface's :class:`_BaseExamplesIterable` blocks.
-
-    This class manages a sequence of processing steps applied to a dataset,
-    allowing for chaining and copying of processing pipelines.
-    """
-
-    @property
-    def src_iterable(self) -> None | _BaseExamplesIterable:
-        """Get the source iterable for the pipeline.
-
-        Returns:
-            _BaseExamplesIterable: The source iterable for the pipeline.
-
-        Raises:
-            AssertionError: If the pipeline is empty.
-        """
-        assert len(self) > 0, "Pipeline is empty; no source iterable available."
-        return self[0].ex_iterable
-
-    def copy(self) -> ExamplesIterablePipeline:
-        """Create a copy of the pipeline with each step copied.
-
-        Returns:
-            ExamplesIterablePipeline: A new pipeline instance with copied steps.
-        """
-        first = copy(self[0])
-        first.ex_iterable = None
-
-        pipeline = ExamplesIterablePipeline([first])
-
-        for step in map(copy, self[1:]):
-            step.ex_iterable = pipeline[-1]
-            pipeline.append(step)
-
-        return pipeline
-
-    def __call__(self, ex_iterable: Iterable[IndexedSample]) -> Iterable[IndexedSample]:
-        """Run the pipeline on the given example iterable.
-
-        Args:
-            ex_iterable (Iterable[IndexedSample]): The example iterable to be processed by the
-                pipeline.
-
-        Returns:
-            Iterable[IndexedSample]: Processed samples from the pipeline.
-        """
-        pipeline = self.copy()
-        pipeline[0].ex_iterable = ex_iterable
-
-        yield from pipeline[-1]
-
-    def __str__(self) -> str:
-        """String representation of the pipeline."""
-        return "[" + ", ".join([type(step).__name__ for step in self]) + "]"
 
 
 class MessageType(Enum):
@@ -417,31 +367,42 @@ class Worker(mp.Process):
             done = False
             # request a processing context
             while (not done) and (not self._request_new_ctx()):
-                # create the data stream iterator here to avoid resetting
-                # it when a new context is received during processing
-                stream = iter(self._ctx.data_stream)
-                producer_exhausted = False
-                # monitor data stream
-                stream = TimedIterator(stream, smoothing=0.1)
+                stream_exhausted = False
+                # create the stoppable data stream iterator here to avoid
+                # resetting it when a new context is received during processing
+                data_stream = TimedExamplesIterable(self._ctx.data_stream, smoothing=0.1)
+                stoppable_stream = StoppableExamplesIterable(data_stream)
 
                 # exhaust producer
-                while not producer_exhausted:
+                while not stream_exhausted:
                     self._send_msg(MessageType.CTX_STARTED, payload=self._ctx.role.value)
                     self._logger.debug(f"Starting processing of {self._ctx}.")
 
                     num_samples = 0
                     last_report = clock()
-                    # create a stoppable producer that allows to dynamically
-                    # interrupt the execution and apply the new context
-                    stoppable_stream = StoppableIterator(stream)
+
+                    stoppable_stream.resume()
 
                     try:
                         # apply the transformation function to the data stream
                         transformed_stream = self._ctx.data_transform(stoppable_stream)
-                        transformed_stream = TimedIterator(transformed_stream, smoothing=0.1)
+                        transformed_stream = TimedExamplesIterable(
+                            transformed_stream, smoothing=0.1
+                        )
                         # apply the finalizer to the transformed stream
-                        work_iterator = map(self._ctx.data_finalizer, transformed_stream)
-                        work_iterator = TimedIterator(work_iterator, smoothing=0.1)
+                        work_iterator = (
+                            IterableDataset(
+                                ex_iterable=transformed_stream,
+                                formatting=self._ctx.data_finalizer_formatting,
+                            )
+                            .map(
+                                lambda data: (self._ctx.data_finalizer(data) or data),
+                                batched=self._ctx.data_finalizer_batch_size is not None,
+                                batch_size=self._ctx.data_finalizer_batch_size,
+                            )
+                            ._ex_iterable
+                        )
+                        work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
 
                         def _report_progress(now: float, num_samples: int, last_report: float):
                             payload = ProgressReport(
@@ -449,12 +410,12 @@ class Worker(mp.Process):
                                 elapsed_time=now - last_report,
                                 num_samples=num_samples,
                                 average_elapsed_time={
-                                    Stages.STREAM.value: stream.smooth_time(),
+                                    Stages.STREAM.value: data_stream.smooth_time(),
                                     Stages.TRANSFORM.value: transformed_stream.smooth_time(),
                                     Stages.FINALIZE.value: work_iterator.smooth_time(),
                                 },
                                 total_elapsed_time={
-                                    Stages.STREAM.value: stream.total_time(),
+                                    Stages.STREAM.value: data_stream.total_time(),
                                     Stages.TRANSFORM.value: transformed_stream.total_time(),
                                     Stages.FINALIZE.value: work_iterator.total_time(),
                                 },
@@ -511,7 +472,7 @@ class Worker(mp.Process):
 
                         else:
                             # producer exhausted
-                            producer_exhausted = True
+                            stream_exhausted = True
                             self._logger.info("Finished processing current context.")
                             # send final progress update and completion message
                             _report_progress(clock(), num_samples, last_report)
@@ -520,7 +481,7 @@ class Worker(mp.Process):
                     except StopIteration:
                         # catch stop execution error
                         self._send_msg(MessageType.CTX_CANCELED)
-                        producer_exhausted = True
+                        stream_exhausted = True
                         done = True
 
                     except KeyboardInterrupt:
@@ -577,49 +538,6 @@ class Worker(mp.Process):
         self._send_msg(MessageType.DONE)
 
 
-class Serializer(object):
-    """Serializer applied in multiprocessing runner stage 2.
-
-    This serializer collects and serialized a batch of samples into a single
-    serialized element using :code:`orjson` to reduce latency. From our experiments
-    :code:`orjson` showed to be the fastest serializer for json-compatible objects.
-    """
-
-    def __init__(self, batch_size: int):
-        """Initialize a new serializer.
-
-        Args:
-            batch_size (int): The number of batches to pack together.
-        """
-        self.batch_size = batch_size
-
-    def serialize(self, it: Iterable[Sample]) -> Iterable[Any]:
-        """Serialization wrapper.
-
-        Args:
-            it (Iterable[Sample]): An iterable of samples to be serialized.
-
-        Returns:
-            Iterable[Any]: An iterable containing the serialized samples,
-            where each sample is serialized to a byte format using orjson.dumps.
-
-        """
-        return map(orjson.dumps, batched(it, n=self.batch_size))
-
-    def deserialize(self, it: Iterable[Any]) -> Iterable[Sample]:
-        """Deserializer wrapper.
-
-        Args:
-            it (Iterable[Any]): An iterable of serialized data (e.g., bytes)
-            to be deserialized.
-
-        Returns:
-            Iterable[Sample]: An iterable of samples, where each serialized
-            data is deserialized using orjson.loads.
-        """
-        return chain.from_iterable(map(orjson.loads, it))
-
-
 class WorkerController(object):
     """Controller for managing worker processes and their roles.
 
@@ -628,17 +546,20 @@ class WorkerController(object):
     state transitions.
     """
 
-    def __init__(self, workers: list[Worker], serializer: Serializer) -> None:
+    def __init__(self, workers: list[Worker], prefetch: int, num_shards: int) -> None:
         """Initializes the WorkerController with the provided workers and serializer.
 
         Args:
             workers (list[Worker]): A list of workers to be controlled.
-            serializer (Serializer): A serializer instance for managing data formats.
+            prefetch (int): The number of samples to prefetch for each worker.
+            num_shards (int): The total number of shards to process.
         """
+        self.prefetch = prefetch
         self.workers = workers
-        self.serializer = serializer
         self.queue = mp.Manager().Queue(maxsize=self.num_workers)
-        self.queue_it = QueueIterator(self.queue, sentinel=None, timeout=1.0)
+        self.queue_it = QueueExamplesIterable(
+            self.queue, sentinel=None, timeout=1.0, num_shards=num_shards
+        )
         self.standalone_ranks = set()
         self.producer_ranks = set()
         self.consumer_ranks = set()
@@ -670,12 +591,14 @@ class WorkerController(object):
 
         self._logger.info("All workers started.")
 
-    def create_processor(
+    def create_standalone_worker(
         self,
         rank: int,
-        shard: Iterable,
+        shard: Iterable[pa.Array],
         transform: Callable[[Iterable], Iterable] | None,
-        fn: Callable[[Any], Any] | None,
+        finalizer: Callable[[Any], Any] | None,
+        finalizer_batch_size: int | None,
+        finalizer_formatting: FormattingConfig | None,
     ) -> None:
         """Assigns a worker the role of processor and provides the processing context.
 
@@ -683,36 +606,46 @@ class WorkerController(object):
             rank (int): The rank of the worker to assign.
             shard (Iterable): The data shard to be processed.
             transform (Callable[[Iterable], Iterable] | None): The transform function.
-            fn (Callable[[Any], Any] | None): The function to be applied to each transformed item.
+            finalizer (Callable[[Any], Any] | None): The finalizer function.
+            finalizer_batch_size (int | None): The finalizer batch size.
+            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
         """
         ctx = WorkerContext(
             role=WorkerRole.STANDALONE,
             data_stream=shard,
             data_transform=transform,
-            data_finalizer=fn,
+            data_finalizer=finalizer,
+            data_finalizer_batch_size=finalizer_batch_size,
+            data_finalizer_formatting=finalizer_formatting,
         )
         self.workers[rank].send_ctx(ctx, blocking=False)
         self.standalone_ranks.add(rank)
         self._logger.info(f"Assigned worker {rank} as standalone worker.")
 
-    def create_consumer(
+    def create_consumer_worker(
         self,
         rank: int,
         transform: Callable[[Iterable], Iterable] | None,
-        fn: Callable[[Any], Any] | None,
+        finalizer: Callable[[Any], Any] | None,
+        finalizer_batch_size: int | None,
+        finalizer_formatting: FormattingConfig | None,
     ) -> None:
         """Assigns a worker the role of consumer and provides the consumer context.
 
         Args:
             rank (int): The rank of the worker to assign.
             transform (Callable[[Iterable], Iterable] | None): The tranform function.
-            fn (Callable[[Any], Any] | None): The function to be applied to each transformed item.
+            finalizer (Callable[[Any], Any] | None): The finalizer function.
+            finalizer_batch_size (int | None): The finalizer batch size.
+            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
         """
         ctx = WorkerContext(
             role=WorkerRole.CONSUMER,
             data_stream=self.queue_it,
-            data_transform=Compose(transform, self.serializer.deserialize),
-            data_finalizer=fn,
+            data_transform=transform,
+            data_finalizer=finalizer,
+            data_finalizer_batch_size=finalizer_batch_size,
+            data_finalizer_formatting=finalizer_formatting,
         )
         self.workers[rank].send_ctx(ctx, blocking=False)
         self.consumer_ranks.add(rank)
@@ -729,8 +662,10 @@ class WorkerController(object):
         """
         ctx_update = WorkerContext(
             role=WorkerRole.PRODUCER,
-            data_transform=self.serializer.serialize,
+            data_transform=QueueExamplesIterable.prepare_ex_iterable,
             data_finalizer=self.queue.put,
+            data_finalizer_batch_size=self.prefetch,
+            data_finalizer_formatting=FormattingConfig(format_type="arrow"),
         )
         for rank in self.standalone_ranks:
             if self.workers[rank].send_ctx(ctx_update, blocking=True):
@@ -741,7 +676,11 @@ class WorkerController(object):
             self._logger.info(f"Worker {rank} did not accept producer context.")
 
     def try_switch_producer_to_standalone(
-        self, transform: Callable[[Iterable], Iterable] | None, fn: Callable[[Any], Any] | None
+        self,
+        transform: Callable[[Iterable], Iterable] | None,
+        finalizer: Callable[[Any], Any] | None,
+        finalizer_batch_size: int | None,
+        finalizer_formatting: FormattingConfig | None,
     ) -> int | None:
         """Attempts to switch a producer to a processor role.
 
@@ -750,13 +689,19 @@ class WorkerController(object):
 
         Args:
             transform (Callable[[Iterable], Iterable] | None): The transform function.
-            fn (Callable[[Any], Any] | None): The function to be applied to each transformed item.
+            finalizer (Callable[[Any], Any] | None): The finalizer function.
+            finalizer_batch_size (int | None): The finalizer batch size.
+            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
 
         Returns:
             int | None: The rank of the worker if the switch is successful, None otherwise.
         """
         ctx_update = WorkerContext(
-            role=WorkerRole.STANDALONE, data_transform=transform, data_finalizer=fn
+            role=WorkerRole.STANDALONE,
+            data_transform=transform,
+            data_finalizer=finalizer,
+            data_finalizer_batch_size=finalizer_batch_size,
+            data_finalizer_formatting=finalizer_formatting,
         )
         for rank in self.producer_ranks:
             if self.workers[rank].send_ctx(ctx_update, blocking=True):
@@ -941,28 +886,29 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
     def _prepare_dataset(
         self, ds: IterableDataset
-    ) -> tuple[_BaseExamplesIterable, Callable[[Iterable[IndexedSample]], Iterable[IndexedSample]]]:
+    ) -> tuple[IterableDataset, Callable[[_BaseExamplesIterable], _BaseExamplesIterable]]:
         """Prepare the dataset for processing by separating processing steps.
 
         Args:
             ds (IterableDataset): The dataset to prepare.
 
         Returns:
-            tuple[IterableDataset, Callable[[Iterable[IndexedSample]], Iterable[IndexedSample]]]:
+            tuple[IterableDataset, Callable[[_BaseExamplesIterable], _BaseExamplesIterable]]:
             A tuple containing the source dataset and a processor function representing the lazy
             operations applied to the dataset.
         """
+        # TODO: rethink which ex_iterable items to include
+        #       maybe just all of them, i.e. all those that have the ex_iterable attribute
         if not hasattr(ds, "_ex_iterable") or not isinstance(
             ds._ex_iterable,
             (
                 MappedExamplesIterable,
                 FilteredExamplesIterable,
                 TypedExamplesIterable,
+                RebatchedArrowExamplesIterable,
             ),
         ):
-            return ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch), partial(
-                ith_entries, i=1
-            )
+            return ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch), identity_func
 
         # collect all processing steps to separate off
         pipeline = ExamplesIterablePipeline([ds._ex_iterable])
@@ -972,6 +918,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 MappedExamplesIterable,
                 FilteredExamplesIterable,
                 TypedExamplesIterable,
+                RebatchedArrowExamplesIterable,
             ),
         ):
             pipeline.insert(0, pipeline.src_iterable)
@@ -981,18 +928,22 @@ class DynamicMultiprocessingRunner(BaseRunner):
         )
 
         # create the source dataaset that excludes the pipeline processing steps
-        src_ds = IterableDataset(ex_iterable=pipeline.src_iterable)
+        src_ds = IterableDataset(
+            ex_iterable=pipeline.src_iterable,
+            formatting=getattr(pipeline.src_iterable, "formatting", None),
+        )
         ex_iterable = src_ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch)
-        # pipeline iterator yields (key, sample)-tuples, drop the key
-        processor = Compose(partial(ith_entries, i=1), pipeline.copy())
 
-        return ex_iterable, processor
+        assert ex_iterable.iter_arrow() is not None
+        return ex_iterable, pipeline
 
     def _handle_message_loop(
         self,
         src_ds: IterableDataset,
-        transform: Callable[[Iterable[T]], Iterable[U]],
-        fn: Callable[[Sample], Any],
+        transform: Callable[[_BaseExamplesIterable], _BaseExamplesIterable],
+        finalizer: Callable[[Any], Any],
+        finalizer_batch_size: None | int,
+        finalizer_formatting: None | FormattingConfig,
         recv_msg_conn: mp.connection.Connection,
         monitor: ProgressMonitor,
         controller: WorkerController,
@@ -1009,8 +960,10 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 processing.
             transform (Callable[[Iterable[T]], Iterable[U]]): A transformation function that
                 processes a shard of data.
-            fn (Callable[[Sample], Any]): A function that handles each sample after it has been
-                transformed.
+            finalizer (Callable[[Any], Any]): A function that finalizes each sample or batch
+                after it has been transformed.
+            finalizer_batch_size (int | None): The finalizer batch size.
+            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
             recv_msg_conn (mp.connection.Connection): The connection object used to receive messages
                 from worker processes.
             monitor (ProgressMonitor): An object responsible for tracking the progress and state
@@ -1047,7 +1000,6 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 controller.join_worker(rank)
                 monitor._mark_worker_done(rank)
                 self._logger.debug(f"Worker {rank} done.")
-                #
                 done = not monitor.any_worker_alive
 
             elif msg_type is MessageType.CTX_STARTED:
@@ -1123,7 +1075,10 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     ):
                         # try to convert an active producer back to a processor
                         switching_worker = controller.try_switch_producer_to_standalone(
-                            transform, fn
+                            transform=transform,
+                            finalizer=finalizer,
+                            finalizer_batch_size=finalizer_batch_size,
+                            finalizer_formatting=finalizer_formatting,
                         )
                         last_switch = now
 
@@ -1141,7 +1096,14 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     shard_id = monitor.pending_shards.pop()
                     # get shard and send processor context to worker
                     shard = src_ds.shard_data_sources(monitor.num_shards, shard_id)
-                    controller.create_processor(rank, shard, transform, fn)
+                    controller.create_standalone_worker(
+                        rank=rank,
+                        shard=shard,
+                        transform=transform,
+                        finalizer=finalizer,
+                        finalizer_batch_size=finalizer_batch_size,
+                        finalizer_formatting=finalizer_formatting,
+                    )
                     # run callback
                     self._callback.on_shard_in_progress(monitor, shard_id)
 
@@ -1157,7 +1119,13 @@ class DynamicMultiprocessingRunner(BaseRunner):
                         controller.try_switch_standalone_to_producer()
 
                     # assign worker as consumer
-                    controller.create_consumer(rank, transform, fn)
+                    controller.create_consumer_worker(
+                        rank=rank,
+                        transform=transform,
+                        finalizer=finalizer,
+                        finalizer_batch_size=finalizer_batch_size,
+                        finalizer_formatting=finalizer_formatting,
+                    )
 
                     # evenutally all workers are consumers
                     if monitor.alive_workers == controller.consumer_ranks:
@@ -1166,12 +1134,23 @@ class DynamicMultiprocessingRunner(BaseRunner):
                         self._callback.on_stopping(monitor)
                         self._logger.info("Stopping criteria reached, gracefully stopping workers.")
 
-    def run(self, ds: IterableDataset, fn: Callable[[Sample], Any]) -> None:
+    def run(
+        self,
+        ds: IterableDataset,
+        finalizer: Callable[[Any], Any],
+        batch_size: None | int = None,
+        formatting: None | str = None,
+    ) -> None:
         """Execute data processing using the worker processes.
 
         Args:
             ds: (IterableDataset): The dataset to process.
-            fn (Callable[[Sample], Any]): The function to apply to each sample in the dataset.
+            finalizer (Callable[[Any], Any]): The function to apply to each sample or batch
+                of samples in the dataset as the final processing step.
+            batch_size (None | int): The size of each batch to process. If :code:`None`,
+                process samples individually. Only affects the finalizer. Defaults to None.
+            formatting (None | str): The data format in which samples or batches are provided
+                to the finalizer function.
         """
         self._logger.info("Starting data processing.")
 
@@ -1195,18 +1174,13 @@ class DynamicMultiprocessingRunner(BaseRunner):
             for rank in range(self._num_workers)
         ]
 
-        # create the serializer used to serialize samples
-        # before putting them into the queue
-        serializer = Serializer(batch_size=self._prefetch)
         # create controller
-        controller = WorkerController(workers, serializer)
+        controller = WorkerController(workers, self._prefetch, num_shards)
         controller.start()
 
         # create the progress monitor, note that the serializer dumps a batch of samples
         # into a single queue element with a batch size set to the prefetch factor
-        monitor = ProgressMonitor(
-            num_shards, self._num_workers, controller.queue, controller.serializer.batch_size
-        )
+        monitor = ProgressMonitor(num_shards, self._num_workers, controller.queue, self._prefetch)
 
         # create the consumer producer balancer
         balancer = ConsumerProducerBalancer(controller, monitor)
@@ -1217,7 +1191,11 @@ class DynamicMultiprocessingRunner(BaseRunner):
             recv_msg_conn=recv_msg_conn,
             src_ds=src_ds,
             transform=transform,
-            fn=fn,
+            finalizer=finalizer,
+            finalizer_batch_size=batch_size,
+            finalizer_formatting=(
+                None if formatting is None else FormattingConfig(format_type=formatting)
+            ),
             monitor=monitor,
             controller=controller,
             balancer=balancer,
