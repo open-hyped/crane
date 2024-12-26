@@ -34,13 +34,14 @@ class BaseExamplesIterable(_BaseExamplesIterable):
         raise NotImplementedError()
 
     @property
-    def iter_arrow(self) -> Iterable[tuple[str, pa.Table]]:
+    def iter_arrow(self) -> None | Iterable[tuple[str, pa.Table]]:
         """Get the arrow iterator.
 
         Returns:
-            Iterable[pa.Table]: Data iterator of pyarrow tables.
+            None | Iterable[pa.Table]: Data iterator of pyarrow tables if supported.
         """
-        return self._iter_arrow
+        if self.ex_iterable.iter_arrow is not None:
+            return self._iter_arrow
 
     def _iter_arrow(self) -> Iterable[tuple[str, pa.Table]]:
         """The arrow data iterator.
@@ -90,6 +91,7 @@ class StoppableExamplesIterable(BaseExamplesIterable):
 
     def init_iter(self) -> None:
         """Initialize the internal iterator."""
+        assert self.ex_iterable.iter_arrow is not None
         self._iter = self.ex_iterable.iter_arrow()
 
     def stop(self) -> None:
@@ -311,6 +313,15 @@ class QueueExamplesIterable(BaseExamplesIterable):
         for key, pa_table in self._iter_arrow():
             for i, item in enumerate(pa_table.to_reader(max_chunksize=1)):
                 yield f"{key}_{i}", formatter.format_row(item)
+
+    @property
+    def iter_arrow(self) -> None | Iterable[tuple[str, pa.Table]]:
+        """Get the arrow iterator.
+
+        Returns:
+            Iterable[pa.Table]: Data iterator of pyarrow tables.
+        """
+        return self._iter_arrow
 
     def _iter_arrow(self) -> Iterable[tuple[str, pa.Table]]:
         """Iterate over the Arrow tables retrieved from the queue.

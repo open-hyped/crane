@@ -13,6 +13,9 @@ from collections import OrderedDict
 from enum import Enum
 from typing import Any, Callable
 
+import pyarrow as pa
+import pyarrow.compute as pc
+
 from .utils import Sample
 
 logger = logging.getLogger(__name__)
@@ -203,18 +206,18 @@ class ShardingController(object):
         self._shard_bytes = 0
         self._sample_size = 0
 
-    def callback(self, batch: list[Sample]) -> Sample:
+    def callback(self, batch: pa.Table) -> Sample:
         """Process each batch before writing and check if a new shard is required.
 
         Args:
-            batch (list[Sample]): The batch of samples to be written.
+            batch (pa.Table): The batch of samples.
 
         Returns:
             [Sample]: The batch, unchanged.
         """
         if self._sharding_strategy is ShardingStrategy.SAMPLE_ITEM:
             # cache the size of the sample to be used later in the shard size update
-            self._sample_size = sum(sample[self._sample_size_key] for sample in batch)
+            self._sample_size = pc.sum(batch.column(self._sample_size_key)).as_py()
 
         # check if shard is full
         if self._shard_size >= self._max_shard_size:

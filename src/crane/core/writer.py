@@ -17,11 +17,12 @@ from functools import partial
 from typing import TypeAlias
 
 import datasets
+import pyarrow as pa
 
 from .callbacks.base import Callback
 from .consumer import DatasetConsumer
 from .sharding import ShardingController, ShardingStrategy
-from .utils import BatchBuffer, Compose, RunAll, Sample, chdir
+from .utils import Compose, RunAll, chdir
 
 logger = logging.getLogger(__name__)
 
@@ -198,9 +199,6 @@ class BaseDatasetWriter(ABC):
             )
         )
 
-        # wrap write function in batch buffer
-        buffered_write_fn = BatchBuffer(batch_size=self._write_batch_size, apply_function=write_fn)
-
         os.makedirs(save_dir, exist_ok=True)
         # convert dataset to iterable dataset
         if isinstance(ds, datasets.Dataset):
@@ -209,15 +207,13 @@ class BaseDatasetWriter(ABC):
         with chdir(save_dir):
             # write dataset to directory
             consumer = DatasetConsumer(
-                buffered_write_fn.add,
                 num_proc=self._num_proc,
                 prefetch_factor=self._prefetch,
-                initialize=RunAll(
+                on_start=RunAll(
                     sharding_controller.initialize,
                     partial(self.initialize, ds.info),
                 ),
-                finalize=RunAll(
-                    buffered_write_fn.flush,
+                on_finish=RunAll(
                     sharding_controller.finalize,
                     partial(self.finalize, ds.info),
                 ),
@@ -225,7 +221,9 @@ class BaseDatasetWriter(ABC):
                 disable_tqdm=self._disable_tqdm,
                 callbacks=self._callbacks,
             )
-            consumer.consume(ds)
+            consumer.consume(
+                ds, finalizer=write_fn, batch_size=self._write_batch_size, formatting="arrow"
+            )
 
             # write dataset info and state
             self._write_state(ds)
@@ -267,7 +265,7 @@ class BaseDatasetWriter(ABC):
             self._write_dataset(ds, self.save_dir)
 
     @abstractmethod
-    def write_batch(self, batch: list[Sample]) -> int:
+    def write_batch(self, batch: pa.Table) -> int:
         """Abstract method for writing a batch of samples.
 
         This method writes a batch of samples to the dataset shard and returns the
@@ -277,7 +275,7 @@ class BaseDatasetWriter(ABC):
         any files created will be saved in the designated dataset directory.
 
         Args:
-            batch (list[Sample]): The batch of samples to be written.
+            batch (pa.Table): The batch of samples in pyarrow table format.
 
         Returns:
             int: The number of bytes written to the shard.

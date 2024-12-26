@@ -5,10 +5,11 @@ The dataset is sharded, with each worker writing to a separate JSON file. Each s
 serialized using :code:`orjson` for efficient performance.
 """
 import orjson
+import pyarrow as pa
+import pyarrow.json
 from datasets import DatasetInfo
 
 from .core import BaseDatasetWriter
-from .core.utils import Sample
 from .core.worker import get_worker_info
 
 
@@ -39,7 +40,7 @@ class JsonDatasetWriter(BaseDatasetWriter):
         info.ctx.file_path = f"shard-{shard_id:05}.json"
         info.ctx.file = open(info.ctx.file_path, "wb", buffering=0)
 
-    def write_batch(self, batch: list[Sample]) -> int:
+    def write_batch(self, batch: pa.Table) -> int:
         """Write a batch of samples to the JSON file.
 
         This method serializes the samples to JSON format using :code:`orjson` and writes
@@ -48,7 +49,7 @@ class JsonDatasetWriter(BaseDatasetWriter):
         The working directory is set to the save directory during this method.
 
         Args:
-            batch (list[Sample]): A list of samples to be written, each of which will be
+            batch (pa.Table): A batch of samples to be written, each of which will be
                 serialized as JSON.
 
         Returns:
@@ -57,7 +58,7 @@ class JsonDatasetWriter(BaseDatasetWriter):
         info = get_worker_info()
         file_size = info.ctx.file.tell()
         # write the sample to the file and return the written bytes
-        serialized = b"\n".join(map(orjson.dumps, batch))
+        serialized = b"\n".join(map(orjson.dumps, batch.to_pylist()))
         info.ctx.file.write(serialized + b"\n")
         return info.ctx.file.tell() - file_size
 
