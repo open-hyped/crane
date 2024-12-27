@@ -69,8 +69,8 @@ def _run_tqdm(monitor: ProgressMonitor, update_interval: float, **kwargs: Any) -
             pbar.set_postfix_str(
                 (
                     f"{monitor.num_buffered_samples}q, "
-                    f"{throughput:.02f}it/s, "
-                    f"{formatted_total_samples}it"
+                    f"{throughput:.02f}ex/s, "
+                    f"{formatted_total_samples}ex"
                 ),
                 refresh=False,
             )

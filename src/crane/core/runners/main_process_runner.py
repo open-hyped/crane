@@ -145,15 +145,12 @@ class MainProcessRunner(BaseRunner):
 
                     # create the python iterable that executes the workload
                     # dynamically use the pyarrow iterable to avoid unnecessary conversion
-                    it = (
-                        work_iterator.iter_arrow()
-                        if (formatting is not None) and (formatting == "arrow")
-                        else iter(work_iterator)
-                    )
+                    iter_arrow = (formatting is not None) and (formatting == "arrow")
+                    it = work_iterator.iter_arrow() if iter_arrow else iter(work_iterator)
 
                     # main worker loop
-                    for _ in it:
-                        num_samples += 1
+                    for _, data in it:
+                        num_samples += data.num_rows if iter_arrow else 1
 
                         now = clock()
                         if now - last_report > self._report_interval:
