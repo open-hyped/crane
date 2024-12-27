@@ -57,7 +57,7 @@ class ArrowDatasetWriter(BaseDatasetWriter):
             sink=worker_info.ctx.file, schema=worker_info.ctx.schema
         )
 
-    def write_batch(self, batch: pa.Table) -> int:
+    def write_batch_arrow(self, batch: pa.Table) -> int:
         """Write a batch of samples to the Arrow shard.
 
         This method writes the samples as a record batch to the worker's shard file

@@ -8,6 +8,7 @@ import orjson
 import pyarrow as pa
 import pyarrow.json
 from datasets import DatasetInfo
+from datasets.iterable_dataset import _batch_to_examples
 
 from .core import BaseDatasetWriter
 from .core.worker import get_worker_info
@@ -40,17 +41,16 @@ class JsonDatasetWriter(BaseDatasetWriter):
         info.ctx.file_path = f"shard-{shard_id:05}.json"
         info.ctx.file = open(info.ctx.file_path, "wb", buffering=0)
 
-    def write_batch(self, batch: pa.Table) -> int:
+    def write_batch_arrow(self, batch: pa.Table) -> int:
         """Write a batch of samples to the JSON file.
 
         This method serializes the samples to JSON format using :code:`orjson` and writes
-        each sample as a line in the JSON file, with samples separated by newlines.
-
-        The working directory is set to the save directory during this method.
+        each sample as a line in the JSON file, with samples separated by newlines. The
+        input :code:`batch` is expected to be in the PyArrow :code:`pa.Table` format.
 
         Args:
-            batch (pa.Table): A batch of samples to be written, each of which will be
-                serialized as JSON.
+            batch (pa.Table): A batch of samples to be written, where each sample is
+                represented as a row in the PyArrow table.
 
         Returns:
             int: The number of bytes written to the shard.
@@ -59,6 +59,28 @@ class JsonDatasetWriter(BaseDatasetWriter):
         file_size = info.ctx.file.tell()
         # write the sample to the file and return the written bytes
         serialized = b"\n".join(map(orjson.dumps, batch.to_pylist()))
+        info.ctx.file.write(serialized + b"\n")
+        return info.ctx.file.tell() - file_size
+
+    def write_batch_py(self, batch: pa.Table) -> int:
+        """Write a batch of samples format to the JSON file.
+
+        This method serializes the samples to JSON format using :code:`orjson` and writes
+        each sample as a line in the JSON file, with samples separated by newlines. The
+        input :code:`batch` is expected to be a dictionary where keys are column names
+        and values are lists of column data.
+
+        Args:
+            batch (dict[str, list[Any]]): A batch of samples to be written, represented as a
+                Python dictionary with column names as keys and lists of data as values.
+
+        Returns:
+            int: The number of bytes written to the shard.
+        """
+        info = get_worker_info()
+        file_size = info.ctx.file.tell()
+        # write the sample to the file and return the written bytes
+        serialized = b"\n".join(map(orjson.dumps, _batch_to_examples(batch)))
         info.ctx.file.write(serialized + b"\n")
         return info.ctx.file.tell() - file_size
 

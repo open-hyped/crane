@@ -14,7 +14,7 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 from functools import partial
-from typing import TypeAlias
+from typing import Any, Callable, ClassVar, TypeAlias
 
 import datasets
 import pyarrow as pa
@@ -55,10 +55,30 @@ class BaseDatasetWriter(ABC):
     The folder structure and save format follows the Hugging Face :func:`save_to_disk`
     structure, ensuring compatibility with datasets saved using this format.
 
-    Subclasses should implement methods for writing individual samples, and initializing
-    and finalizing the write operation. The working directory is temporarily set to the
-    save directory for writing operations.
+    Subclasses must implement at least one of the format-specific write methods
+    (:func:`write_batch_py` or :func:`write_batch_arrow`). When writing a batch,
+    the writer automatically routes to the best fitting supported function based
+    on the format of the dataset being written to, minimizing format conversion
+    overhead.
     """
+
+    SUPPORTED_FORMATS: ClassVar[dict[str, Callable[[Any], int]]] = dict()
+
+    def __init_subclass__(cls, **kwargs):
+        """Check for supported formats."""
+        super().__init_subclass__(**kwargs)
+        cls.SUPPORTED_FORMATS = {}
+        # Detect supported formats by checking if the methods are overridden
+        if cls.write_batch_py != BaseDatasetWriter.write_batch_py:
+            cls.SUPPORTED_FORMATS["python"] = cls.write_batch_py
+        if cls.write_batch_arrow != BaseDatasetWriter.write_batch_arrow:
+            cls.SUPPORTED_FORMATS["arrow"] = cls.write_batch_arrow
+        # Ensure at least one method is implemented
+        if len(cls.SUPPORTED_FORMATS) == 0:
+            raise TypeError(
+                f"`{cls.__name__}` must override at least one of "
+                "`write_batch_py` or `write_batch_arrow`."
+            )
 
     def __init__(
         self,
@@ -167,8 +187,6 @@ class BaseDatasetWriter(ABC):
                 written.
             save_dir (str): The directory where the split data will be saved.
         """
-        logger.info(f"Writing dataset split {ds.split} to {os.getcwd()}.")
-
         if ds.info is None:
             warnings.warn(
                 "The dataset has no metadata information (ds.info is None). "
@@ -188,13 +206,29 @@ class BaseDatasetWriter(ABC):
             finalize_shard=partial(self.finalize_shard, info=ds.info),
         )
 
+        supported_formats = type(self).SUPPORTED_FORMATS
+        # get the dataset formatting
+        formatting = ds._formatting
+        formatting = formatting.format_type if formatting is not None else "python"
+        # get the fallback formatting in case the dataset formatting is not supported
+        fallback_formatting = next(iter(supported_formats.keys()))
+        fallback_write_fn = supported_formats[fallback_formatting]
+        # get the formatting to use for the write operation
+        formatting = formatting if formatting in supported_formats else fallback_formatting
+        write_fn = supported_formats.get(formatting, fallback_write_fn)
+        write_fn = write_fn.__get__(self, type(self))  # bind the write function to self
+
+        logger.info(
+            f"Routing write operation to {formatting} implementation ({write_fn.__qualname__})."
+        )
+
         # wrap write function in sharding callback if needed
         write_fn = (
-            self.write_batch
+            write_fn
             if not sharding_controller.is_active
             else Compose(
                 sharding_controller.update,
-                self.write_batch,
+                write_fn,
                 sharding_controller.callback,
             )
         )
@@ -203,6 +237,8 @@ class BaseDatasetWriter(ABC):
         # convert dataset to iterable dataset
         if isinstance(ds, datasets.Dataset):
             ds = ds.to_iterable_dataset(self._num_proc)
+
+        logger.info(f"Writing dataset split {ds.split} to {os.getcwd()}.")
 
         with chdir(save_dir):
             # write dataset to directory
@@ -222,7 +258,7 @@ class BaseDatasetWriter(ABC):
                 callbacks=self._callbacks,
             )
             consumer.consume(
-                ds, finalizer=write_fn, batch_size=self._write_batch_size, formatting="arrow"
+                ds, finalizer=write_fn, batch_size=self._write_batch_size, formatting=formatting
             )
 
             # write dataset info and state
@@ -264,8 +300,25 @@ class BaseDatasetWriter(ABC):
             # save dataset to directory
             self._write_dataset(ds, self.save_dir)
 
-    @abstractmethod
-    def write_batch(self, batch: pa.Table) -> int:
+    def write_batch_py(self, batch: dict[str, list[Any]]) -> int:
+        """Abstract method for writing a batch of samples in Python-native format.
+
+        This method writes a batch of samples to the dataset shard and returns the
+        number of bytes written.
+
+        The working directory is temporarily set to the save directory during this method,
+        and any files created will be saved in the designated dataset directory.
+
+        Args:
+            batch (dict[str, list[Any]]): The batch of samples, where keys are column names
+                and values are lists of column data.
+
+        Returns:
+            int: The number of bytes written to the shard.
+        """
+        raise NotImplementedError()
+
+    def write_batch_arrow(self, batch: pa.Table) -> int:
         """Abstract method for writing a batch of samples.
 
         This method writes a batch of samples to the dataset shard and returns the
@@ -280,7 +333,7 @@ class BaseDatasetWriter(ABC):
         Returns:
             int: The number of bytes written to the shard.
         """
-        ...
+        raise NotImplementedError()
 
     def initialize(self, info: datasets.DatasetInfo) -> None:
         """Initialize the global dataset write process.
