@@ -40,6 +40,7 @@ from datasets.iterable_dataset import (
 from ..callbacks.base import CallbackManager
 from ..iterables import (
     ExamplesIterablePipeline,
+    FastRebatchedArrowExamplesIterable,
     QueueExamplesIterable,
     StoppableExamplesIterable,
     TimedExamplesIterable,
@@ -401,6 +402,26 @@ class Worker(mp.Process):
                         )
                         work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
 
+                        # replace all rebatch operations with fast rebatch
+                        # this especially replaces the rebatch operation that was added
+                        # by the .map call earlier
+                        work_iterator = FastRebatchedArrowExamplesIterable.replace_rebatch(
+                            work_iterator
+                        )
+
+                        # prepare the iterator for iteration
+                        work_iterator._init_state_dict()
+                        # create the python iterable that executes the workload
+                        # dynamically use the pyarrow iterable to avoid unnecessary conversion
+                        it = (
+                            work_iterator.iter_arrow()
+                            if (
+                                (self._ctx.data_finalizer_formatting is not None)
+                                and (self._ctx.data_finalizer_formatting.format_type == "arrow")
+                            )
+                            else iter(work_iterator)
+                        )
+
                         def _report_progress(now: float, num_samples: int, last_report: float):
                             payload = ProgressReport(
                                 timestamp=now,
@@ -418,17 +439,6 @@ class Worker(mp.Process):
                                 },
                             )
                             self._send_msg(MessageType.CTX_REPORT, payload=payload)
-
-                        # create the python iterable that executes the workload
-                        # dynamically use the pyarrow iterable to avoid unnecessary conversion
-                        it = (
-                            work_iterator.iter_arrow()
-                            if (
-                                (self._ctx.data_finalizer_formatting is not None)
-                                and (self._ctx.data_finalizer_formatting.format_type == "arrow")
-                            )
-                            else iter(work_iterator)
-                        )
 
                         # main worker loop
                         for _ in it:
@@ -905,10 +915,15 @@ class DynamicMultiprocessingRunner(BaseRunner):
             A tuple containing the source dataset and a processor function representing the lazy
             operations applied to the dataset.
         """
+        # get the examples iterable from the dataset and replace all rebatch operations
+        # with fast rebatch, we do this once at the beginning to make sure the transform
+        # also contains only fast rebatch operations
+        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ds._ex_iterable)
+
         # TODO: rethink which ex_iterable items to include
         #       maybe just all of them, i.e. all those that have the ex_iterable attribute
-        if not hasattr(ds, "_ex_iterable") or not isinstance(
-            ds._ex_iterable,
+        if isinstance(
+            ex_iterable,
             (
                 MappedExamplesIterable,
                 FilteredExamplesIterable,
@@ -916,33 +931,40 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 RebatchedArrowExamplesIterable,
             ),
         ):
-            return ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch), identity_func
+            # collect all processing steps to separate off
+            transform = ExamplesIterablePipeline([ex_iterable])
+            while isinstance(
+                transform.src_iterable,
+                (
+                    MappedExamplesIterable,
+                    FilteredExamplesIterable,
+                    TypedExamplesIterable,
+                    RebatchedArrowExamplesIterable,
+                ),
+            ):
+                transform.insert(0, transform.src_iterable)
 
-        # collect all processing steps to separate off
-        pipeline = ExamplesIterablePipeline([ds._ex_iterable])
-        while isinstance(
-            pipeline.src_iterable,
-            (
-                MappedExamplesIterable,
-                FilteredExamplesIterable,
-                TypedExamplesIterable,
-                RebatchedArrowExamplesIterable,
-            ),
-        ):
-            pipeline.insert(0, pipeline.src_iterable)
+            self._logger.info(
+                f"Separated {len(transform)} processing steps from iterable "
+                f"dataset: {str(transform)}"
+            )
 
-        self._logger.info(
-            f"Separated {len(pipeline)} processing steps from iterable dataset: {str(pipeline)}"
+            ex_iterable = transform.src_iterable
+
+        else:
+            # no operations found to separate from the dataset
+            transform = identity_func
+
+        # create the source dataset from the examples iterable
+        # needs to be arrow formatting to apply rebatching in call to
+        # prepare_ex_iterable_from_iteration later
+        ds = IterableDataset(
+            ex_iterable=transform.src_iterable, formatting=FormattingConfig(format_type="arrow")
         )
-
-        # create the source dataaset that excludes the pipeline processing steps
-        src_ds = IterableDataset(
-            ex_iterable=pipeline.src_iterable, formatting=FormattingConfig(format_type="arrow")
-        )
-        ex_iterable = src_ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch)
-
-        assert ex_iterable.iter_arrow() is not None
-        return ex_iterable, pipeline
+        # replace rebatch operations with fast rebatch
+        ex_iterable = ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch)
+        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ex_iterable)
+        return ex_iterable, transform
 
     def _handle_message_loop(
         self,
