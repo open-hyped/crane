@@ -18,6 +18,16 @@ from typing import Any, Callable, ClassVar, TypeAlias
 
 import datasets
 import pyarrow as pa
+from datasets.iterable_dataset import (
+    ArrowExamplesIterable,
+    BufferShuffledExamplesIterable,
+    RebatchedArrowExamplesIterable,
+    SelectColumnsIterable,
+    SkipExamplesIterable,
+    StepExamplesIterable,
+    TakeExamplesIterable,
+    TypedExamplesIterable,
+)
 
 from .callbacks.base import Callback
 from .consumer import DatasetConsumer
@@ -177,6 +187,49 @@ class BaseDatasetWriter(ABC):
         with open(datasets.config.DATASET_STATE_JSON_FILENAME, "w", encoding="utf-8") as state_file:
             json.dump(state, state_file, indent=2, sort_keys=True)
 
+    def _get_write_fn(
+        self, ds: datasets.IterableDataset | datasets.Dataset
+    ) -> tuple[str, Callable]:
+        """Determine the best format and corresponding write function for the dataset.
+
+        Args:
+            ds (datasets.IterableDataset | datasets.Dataset): The dataset or iterable
+                dataset to be written.
+
+        Returns:
+            tuple[str, Callable]: The determined formatting and the bound write function
+                corresponding to the formatting.
+        """
+        ex_iterable = ds._ex_iterable
+        # skip all operators that have no affect on the underlying data format
+        while isinstance(
+            ex_iterable,
+            (
+                TypedExamplesIterable,
+                SelectColumnsIterable,
+                StepExamplesIterable,
+                BufferShuffledExamplesIterable,
+                SkipExamplesIterable,
+                TakeExamplesIterable,
+            ),
+        ):
+            ex_iterable = ex_iterable.ex_iterable
+        # use arrow format if the underlying iterable yields arrow tables
+        if isinstance(ds._ex_iterable, (ArrowExamplesIterable, RebatchedArrowExamplesIterable)):
+            ds = ds.with_format(type="arrow")
+
+        supported_formats = type(self).SUPPORTED_FORMATS
+        # Get the dataset formatting
+        formatting = ds._formatting
+        formatting = formatting.format_type if formatting is not None else "python"
+        # Get the fallback formatting in case the dataset formatting is not supported
+        fallback_formatting = next(iter(supported_formats.keys()))
+        fallback_write_fn = supported_formats[fallback_formatting]
+        # Determine the formatting to use for the write operation
+        formatting = formatting if formatting in supported_formats else fallback_formatting
+        write_fn = supported_formats.get(formatting, fallback_write_fn)
+        return formatting, write_fn.__get__(self, type(self))
+
     def _write_dataset(
         self, ds: datasets.IterableDataset | datasets.Dataset, save_dir: str
     ) -> None:
@@ -196,6 +249,15 @@ class BaseDatasetWriter(ABC):
                 UserWarning,
             )
 
+        # convert dataset to iterable dataset
+        if isinstance(ds, datasets.Dataset):
+            ds = ds.to_iterable_dataset(self._num_proc)
+
+        formatting, write_fn = self._get_write_fn(ds)
+        logger.info(
+            f"Routing write operation to {formatting} implementation ({write_fn.__qualname__})."
+        )
+
         # create sharding controller
         sharding_controller = ShardingController(
             is_multi_processed=self._num_proc > 1,
@@ -204,22 +266,6 @@ class BaseDatasetWriter(ABC):
             sample_size_key=self._sample_size_key,
             initialize_shard=partial(self.initialize_shard, info=ds.info),
             finalize_shard=partial(self.finalize_shard, info=ds.info),
-        )
-
-        supported_formats = type(self).SUPPORTED_FORMATS
-        # get the dataset formatting
-        formatting = ds._formatting
-        formatting = formatting.format_type if formatting is not None else "python"
-        # get the fallback formatting in case the dataset formatting is not supported
-        fallback_formatting = next(iter(supported_formats.keys()))
-        fallback_write_fn = supported_formats[fallback_formatting]
-        # get the formatting to use for the write operation
-        formatting = formatting if formatting in supported_formats else fallback_formatting
-        write_fn = supported_formats.get(formatting, fallback_write_fn)
-        write_fn = write_fn.__get__(self, type(self))  # bind the write function to self
-
-        logger.info(
-            f"Routing write operation to {formatting} implementation ({write_fn.__qualname__})."
         )
 
         # wrap write function in sharding callback if needed
@@ -233,13 +279,9 @@ class BaseDatasetWriter(ABC):
             )
         )
 
-        os.makedirs(save_dir, exist_ok=True)
-        # convert dataset to iterable dataset
-        if isinstance(ds, datasets.Dataset):
-            ds = ds.to_iterable_dataset(self._num_proc)
-
         logger.info(f"Writing dataset split {ds.split} to {os.getcwd()}.")
 
+        os.makedirs(save_dir, exist_ok=True)
         with chdir(save_dir):
             # write dataset to directory
             consumer = DatasetConsumer(
