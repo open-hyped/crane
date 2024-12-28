@@ -957,7 +957,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         # needs to be arrow formatting to apply rebatching in call to
         # prepare_ex_iterable_from_iteration later
         ds = IterableDataset(
-            ex_iterable=transform.src_iterable, formatting=FormattingConfig(format_type="arrow")
+            ex_iterable=ex_iterable, formatting=FormattingConfig(format_type="arrow")
         )
         # replace rebatch operations with fast rebatch
         ex_iterable = ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch)

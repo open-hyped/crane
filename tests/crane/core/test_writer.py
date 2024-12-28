@@ -15,11 +15,14 @@ class TestBaseDatasetWriter:
         ds = ds.to_iterable_dataset(1)
 
         class MockDatasetWriter(BaseDatasetWriter):
-            write_batch = MagicMock()
+            write_batch_py = MagicMock()
             initialize = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()
+
+        MockDatasetWriter.write_batch_py.__get__ = MagicMock()
+        MockDatasetWriter.write_batch_py.__qualname__ = "MockDatasetWriter.write_batch_py"
 
         with (
             patch("crane.core.writer.DatasetConsumer") as consumer_mock,
@@ -39,7 +42,7 @@ class TestBaseDatasetWriter:
             # check dataset consumer
             consumer_mock.assert_called_once()
             consumer_mock().consume.assert_called_once_with(
-                ds, finalizer=ANY, batch_size=1, formatting="arrow"
+                ds, finalizer=ANY, batch_size=1, formatting="python"
             )
 
             # get arguments to consumer initializer
@@ -54,10 +57,10 @@ class TestBaseDatasetWriter:
             # and finally the update function
             if with_sharding:
                 sharding_mock().callback.assert_called_once_with(mock_batch)
-                writer.write_batch.assert_called_once_with(sharding_mock().callback())
-                sharding_mock().update(writer.write_batch())
+                writer.write_batch_py.assert_called_once_with(sharding_mock().callback())
+                sharding_mock().update(writer.write_batch_py())
             else:
-                writer.write_batch.assert_called_once_with(mock_batch)
+                writer.write_batch_py.assert_called_once_with(mock_batch)
 
             # make sure the sharding initializers is called
             init()
@@ -85,7 +88,7 @@ class TestBaseDatasetWriter:
 
         class MockDatasetWriter(BaseDatasetWriter):
             initialize = MagicMock()
-            write_batch = MagicMock()
+            write_batch_py = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()
@@ -106,7 +109,7 @@ class TestBaseDatasetWriter:
 
         class MockDatasetWriter(BaseDatasetWriter):
             initialize = MagicMock()
-            write_batch = MagicMock()
+            write_batch_py = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()
