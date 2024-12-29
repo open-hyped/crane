@@ -8,7 +8,12 @@ from typing import Any, Iterable
 
 import pyarrow as pa
 from datasets.formatting import PythonFormatter
-from datasets.iterable_dataset import _BaseExamplesIterable
+from datasets.iterable_dataset import (
+    Key,
+    RebatchedArrowExamplesIterable,
+    _BaseExamplesIterable,
+    _convert_to_arrow,
+)
 
 from .utils import EMA, clock
 
@@ -25,7 +30,7 @@ class BaseExamplesIterable(_BaseExamplesIterable):
         super(BaseExamplesIterable, self).__init__()
         self.ex_iterable = ex_iterable
 
-    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
+    def __iter__(self) -> Iterable[tuple[str, dict[Key, Any]]]:
         """Iterate over the examples.
 
         Raises:
@@ -34,7 +39,7 @@ class BaseExamplesIterable(_BaseExamplesIterable):
         raise NotImplementedError()
 
     @property
-    def iter_arrow(self) -> None | Iterable[tuple[str, pa.Table]]:
+    def iter_arrow(self) -> None | Iterable[tuple[Key, pa.Table]]:
         """Get the arrow iterator.
 
         Returns:
@@ -43,7 +48,7 @@ class BaseExamplesIterable(_BaseExamplesIterable):
         if self.ex_iterable.iter_arrow is not None:
             return self._iter_arrow
 
-    def _iter_arrow(self) -> Iterable[tuple[str, pa.Table]]:
+    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
         """The arrow data iterator.
 
         Implements the Iterator of pyarrow tables.
@@ -87,7 +92,7 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         """
         super(StoppableExamplesIterable, self).__init__(ex_iterable)
         self._flag = False
-        self._iter: None | Iterable[tuple[str, pa.Table]] = None
+        self._iter: None | Iterable[tuple[Key, pa.Table]] = None
 
     def init_iter(self) -> None:
         """Initialize the internal iterator."""
@@ -102,11 +107,11 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         """Resume the iteration."""
         self._flag = False
 
-    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
+    def __iter__(self) -> Iterable[tuple[Key, dict[str, Any]]]:
         """Iterate over the examples.
 
         Yields:
-            tuple[key, dict[str, Any]]: A tuple containing a key and the formatted example.
+            tuple[key, dict[Key, Any]]: A tuple containing a key and the formatted example.
         """
         if self._iter is None:
             self.init_iter()
@@ -118,17 +123,14 @@ class StoppableExamplesIterable(BaseExamplesIterable):
             if self._flag:
                 return
 
-    def _iter_arrow(self) -> Iterable[tuple[str, pa.Table]]:
+    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
         """The arrow data iterator.
 
         Implements the Iterator of pyarrow tables.
 
         Yields:
-            tuple[str, pa.Table]: A tuple containing a key and pyarrow table.
+            tuple[Key, pa.Table]: A tuple containing a key and pyarrow table.
         """
-        if self._flag:
-            return
-
         if self._iter is None:
             self.init_iter()
 
@@ -168,11 +170,11 @@ class TimedExamplesIterable(BaseExamplesIterable):
         """Returns the total processing time spent iterating over the entire dataset."""
         return self.total
 
-    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
+    def __iter__(self) -> Iterable[tuple[Key, dict[str, Any]]]:
         """Iterate over the examples, tracking and updating processing time statistics.
 
         Yields:
-            Tuple[str, dict[str, Any]]: A tuple containing the key and the next item from the
+            Tuple[Key, dict[str, Any]]: A tuple containing the key and the next item from the
                 underlying iterable.
         """
         st = clock()
@@ -187,11 +189,11 @@ class TimedExamplesIterable(BaseExamplesIterable):
             yield (key, item)
             st = nt
 
-    def _iter_arrow(self) -> Iterable[pa.Table]:
+    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
         """Iterates over the Arrow tables of the underlying iterable, tracking processing time.
 
         Yields:
-            Tuple[str, pa.Table]: A tuple containing the key and the next Arrow table.
+            Tuple[Key, pa.Table]: A tuple containing the key and the next Arrow table.
                 Returns None if the underlying iterable's :code:`iter_arrow` returns None.
         """
         if self.ex_iterable.iter_arrow is None:
@@ -228,7 +230,7 @@ class PreQueueExamplesIterable(BaseExamplesIterable):
         super().__init__(ex_iterable)
         self.key = key
 
-    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
+    def __iter__(self) -> Iterable[tuple[Key, dict[str, Any]]]:
         """Iterate over the examples.
 
         Raises:
@@ -237,11 +239,11 @@ class PreQueueExamplesIterable(BaseExamplesIterable):
         """
         raise NotImplementedError()
 
-    def _iter_arrow(self) -> Iterable[tuple[str, pa.Table]]:
+    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
         """Iterate over the Arrow tables, adding a key to the metadata.
 
         Yields:
-            Tuple[str, pa.Table]: A tuple containing the key and the modified Arrow table
+            Tuple[Key, pa.Table]: A tuple containing the key and the modified Arrow table
                 with the added metadata.
         """
         for key, pa_table in self.ex_iterable._iter_arrow():
@@ -299,11 +301,11 @@ class QueueExamplesIterable(BaseExamplesIterable):
         self.timeout = timeout
         self.n_shards = num_shards
 
-    def __iter__(self) -> Iterable[tuple[str, dict[str, Any]]]:
+    def __iter__(self) -> Iterable[tuple[Key, dict[str, Any]]]:
         """Iterate over the examples retrieved from the queue.
 
         Yields:
-            Tuple[str, dict[str, Any]]: A tuple containing the key and the formatted example.
+            tuple[Key, dict[str, Any]]: A tuple containing the key and the formatted example.
         """
         formatter = PythonFormatter()
         for key, pa_table in self._iter_arrow():
@@ -311,7 +313,7 @@ class QueueExamplesIterable(BaseExamplesIterable):
                 yield f"{key}_{i}", formatter.format_row(item)
 
     @property
-    def iter_arrow(self) -> None | Iterable[tuple[str, pa.Table]]:
+    def iter_arrow(self) -> None | Iterable[tuple[Key, pa.Table]]:
         """Get the arrow iterator.
 
         Returns:
@@ -319,11 +321,11 @@ class QueueExamplesIterable(BaseExamplesIterable):
         """
         return self._iter_arrow
 
-    def _iter_arrow(self) -> Iterable[tuple[str, pa.Table]]:
+    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
         """Iterate over the Arrow tables retrieved from the queue.
 
         Yields:
-            Tuple[str, pa.Table]: A tuple containing the key and the Arrow table.
+            tuple[Key, pa.Table]: A tuple containing the key and the Arrow table.
         """
         while True:
             try:
@@ -332,6 +334,7 @@ class QueueExamplesIterable(BaseExamplesIterable):
                     metadata = pa_table.schema.metadata
                     key = metadata.pop(b"_key").decode()
                     yield key, pa_table.replace_schema_metadata(metadata=metadata)
+                break
             except Empty:
                 break
 
@@ -348,6 +351,127 @@ class QueueExamplesIterable(BaseExamplesIterable):
         """
         self._state_dict = {}
         return self._state_dict
+
+
+class FastRebatchedArrowExamplesIterable(RebatchedArrowExamplesIterable):
+    """An optimized iterable for rebatching Arrow tables.
+
+    This class extends :class:`RebatchedArrowExamplesIterable` to efficiently handle
+    Arrow table rebatching, including combining smaller chunks into batches of
+    a specified size.
+    """
+
+    @classmethod
+    def replace_rebatch(cls, ex_iterable: _BaseExamplesIterable) -> _BaseExamplesIterable:
+        """Replace the rebatching operation in an examples iterable.
+
+        This method recursively replaces instances of :class:`RebatchedArrowExamplesIterable`
+        within an iterable with :class:`FastRebatchedArrowExamplesIterable`, retaining the
+        configuration (e.g., batch size, drop_last_batch).
+
+        Args:
+            ex_iterable (_BaseExamplesIterable): The examples iterable to modify.
+
+        Returns:
+            _BaseExamplesIterable: The modified examples iterable with replaced rebatching.
+        """
+        if isinstance(ex_iterable, RebatchedArrowExamplesIterable):
+            return cls(
+                ex_iterable=ex_iterable.ex_iterable,
+                batch_size=ex_iterable.batch_size,
+                drop_last_batch=ex_iterable.drop_last_batch,
+            )
+
+        if hasattr(ex_iterable, "ex_iterable"):
+            ex_iterable.ex_iterable = cls.replace_rebatch(ex_iterable.ex_iterable)
+
+        return ex_iterable
+
+    def rebatch_arrow(self, it: Iterable[tuple[Key, pa.Table]]) -> Iterable[tuple[Key, pa.Table]]:
+        """Rebatch Arrow tables into sub-tables of the specified batch size.
+
+        If the :code:`batch_size` is not set or is less than or equal to zero, this method
+        concatenates all Arrow tables and yields them as a single batch. Otherwise,
+        it processes the tables to yield batches of the specified size. Remaining
+        smaller chunks are buffered and combined as subsequent data becomes available.
+
+        Args:
+            it (Iterable[tuple[Key, pa.Table]]): An iterable of Arrow tables with keys.
+
+        Yields:
+            tuple[Key, pa.Table]: A tuple containing the key and the rebatched Arrow table.
+        """
+        # return full arrow table containing the whole dataset
+        # mirrors the behavior implemented in _convert_to_arrow
+        if (self.batch_size is None) or (self.batch_size <= 0):
+            yield ("all", pa.concat_tables([pa_table for _, pa_table in it]))
+            return
+
+        keys_buffer = []
+        chunks_buffer = []
+
+        for key, pa_table in it:
+            for i, chunk in enumerate(pa_table.to_reader(max_chunksize=self.batch_size)):
+                # check if the chunk matches the batch size
+                if len(chunk) == self.batch_size:
+                    yield f"{key}_{i}", pa.Table.from_batches([chunk])
+                else:
+                    # update buffers
+                    keys_buffer.append(f"{key}_{i}")
+                    chunks_buffer.append(chunk)
+
+            # buffer contains enough samples to build batch
+            while sum(map(len, chunks_buffer)) >= self.batch_size:
+                collected_keys_buffer = []
+                collected_chunks_buffer = []
+                # collect chunks that make up a batch
+                while sum(map(len, collected_chunks_buffer)) < self.batch_size:
+                    chunk = chunks_buffer.pop(0)
+                    collected_keys_buffer.append(keys_buffer.pop(0))
+                    collected_chunks_buffer.append(chunk)
+
+                size = sum(map(len, collected_chunks_buffer))
+                # cut last chunk to exactly match batch size
+                if size > self.batch_size:
+                    chunk = collected_chunks_buffer.pop(-1)
+                    cutoff = len(chunk) - (size - self.batch_size)
+                    collected_chunks_buffer.append(chunk.slice(0, cutoff))
+                    chunks_buffer.append(chunk.slice(cutoff))
+                    keys_buffer.append(collected_keys_buffer[-1])
+
+                # join collected chunks
+                batch = pa.Table.from_batches(collected_chunks_buffer)
+                assert len(batch) == self.batch_size
+                yield "_".join(collected_keys_buffer), batch
+
+        if len(chunks_buffer) > 0 and not self.drop_last_batch:
+            batch = pa.Table.from_batches(chunks_buffer)
+            assert len(batch) < self.batch_size
+            yield "_".join(keys_buffer), batch
+
+    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
+        """Iterate over Arrow tables, rebatching them as per the configured batch size.
+
+        If :code:`batch_size` is set, the data is iterated and rebatched into sub-tables of
+        the specified size. Otherwise, the entire dataset is processed as a single batch.
+
+        Yields:
+            tuple[Key, pa.Table]: A tuple containing the key and the Arrow table.
+        """
+        # recover state if present
+        if self._state_dict and self._state_dict["previous_state"]:
+            self.ex_iterable.load_state_dict(self._state_dict["previous_state"])
+        # create the iterator over pyarrow tables
+        it = (
+            self.rebatch_arrow(self.ex_iterable.iter_arrow())
+            if self.ex_iterable.iter_arrow is not None
+            else _convert_to_arrow(
+                self.ex_iterable, batch_size=self.batch_size, drop_last_batch=self.drop_last_batch
+            )
+        )
+
+        # TODO: manage state
+        yield from it
 
 
 class ExamplesIterablePipeline(list[_BaseExamplesIterable]):

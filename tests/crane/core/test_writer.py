@@ -3,23 +3,95 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import datasets
 import pytest
-from datasets import Dataset, IterableDatasetDict
+from datasets import Dataset, IterableDataset, IterableDatasetDict
 
 from crane.core.writer import BaseDatasetWriter
 
 
 class TestBaseDatasetWriter:
+    def test_supported_write_formats(self) -> None:
+        with pytest.raises(TypeError):
+            # no write format supported
+            class MockDatasetWriter(BaseDatasetWriter):
+                initialize = MagicMock()
+                finalize = MagicMock()
+                initialize_shard = MagicMock()
+                finalize_shard = MagicMock()
+
+        class MockDatasetWriter(BaseDatasetWriter):
+            write_batch_py = MagicMock()
+            initialize = MagicMock()
+            finalize = MagicMock()
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        assert "python" in MockDatasetWriter.SUPPORTED_FORMATS
+        assert len(MockDatasetWriter.SUPPORTED_FORMATS) == 1
+
+        class MockDatasetWriter(BaseDatasetWriter):
+            write_batch_arrow = MagicMock()
+            initialize = MagicMock()
+            finalize = MagicMock()
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        assert "arrow" in MockDatasetWriter.SUPPORTED_FORMATS
+        assert len(MockDatasetWriter.SUPPORTED_FORMATS) == 1
+
+        class MockDatasetWriter(BaseDatasetWriter):
+            write_batch_py = MagicMock()
+            write_batch_arrow = MagicMock()
+            initialize = MagicMock()
+            finalize = MagicMock()
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        assert "arrow" in MockDatasetWriter.SUPPORTED_FORMATS
+        assert "python" in MockDatasetWriter.SUPPORTED_FORMATS
+        assert len(MockDatasetWriter.SUPPORTED_FORMATS) == 2
+
+    def test_get_write_fn(self) -> None:
+        class MockDatasetWriter(BaseDatasetWriter):
+            write_batch_py = MagicMock()
+            write_batch_arrow = MagicMock()
+            initialize = MagicMock()
+            finalize = MagicMock()
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        MockDatasetWriter.write_batch_py.__get__ = MagicMock()
+        MockDatasetWriter.write_batch_arrow.__get__ = MagicMock()
+
+        mock_writer = MockDatasetWriter("out")
+        ds = IterableDataset.from_generator([])
+
+        # None type is python
+        formatting, writer_fn = mock_writer._get_write_fn(ds.with_format(type=None))
+        assert formatting == "python"
+        assert writer_fn == mock_writer.write_batch_py
+        # python
+        formatting, writer_fn = mock_writer._get_write_fn(ds.with_format(type="python"))
+        assert formatting == "python"
+        assert writer_fn == mock_writer.write_batch_py
+        # arrow
+        formatting, writer_fn = mock_writer._get_write_fn(ds.with_format(type="arrow"))
+        assert formatting == "arrow"
+        assert writer_fn == mock_writer.write_batch_arrow
+
     @pytest.mark.parametrize("with_sharding", [True, False])
     def test_write_split(self, tmp_path, with_sharding):
         ds = Dataset.from_dict({"obj": [0]})
         ds = ds.to_iterable_dataset(1)
 
         class MockDatasetWriter(BaseDatasetWriter):
-            write_batch = MagicMock()
+            write_batch_py = MagicMock()
             initialize = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()
+
+        MockDatasetWriter.write_batch_py.__get__ = MagicMock()
+        MockDatasetWriter.write_batch_py.__qualname__ = "MockDatasetWriter.write_batch_py"
 
         with (
             patch("crane.core.writer.DatasetConsumer") as consumer_mock,
@@ -39,7 +111,7 @@ class TestBaseDatasetWriter:
             # check dataset consumer
             consumer_mock.assert_called_once()
             consumer_mock().consume.assert_called_once_with(
-                ds, finalizer=ANY, batch_size=1, formatting="arrow"
+                ds, finalizer=ANY, batch_size=1, formatting="python"
             )
 
             # get arguments to consumer initializer
@@ -54,10 +126,10 @@ class TestBaseDatasetWriter:
             # and finally the update function
             if with_sharding:
                 sharding_mock().callback.assert_called_once_with(mock_batch)
-                writer.write_batch.assert_called_once_with(sharding_mock().callback())
-                sharding_mock().update(writer.write_batch())
+                writer.write_batch_py.assert_called_once_with(sharding_mock().callback())
+                sharding_mock().update(writer.write_batch_py())
             else:
-                writer.write_batch.assert_called_once_with(mock_batch)
+                writer.write_batch_py.assert_called_once_with(mock_batch)
 
             # make sure the sharding initializers is called
             init()
@@ -85,7 +157,7 @@ class TestBaseDatasetWriter:
 
         class MockDatasetWriter(BaseDatasetWriter):
             initialize = MagicMock()
-            write_batch = MagicMock()
+            write_batch_py = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()
@@ -106,7 +178,7 @@ class TestBaseDatasetWriter:
 
         class MockDatasetWriter(BaseDatasetWriter):
             initialize = MagicMock()
-            write_batch = MagicMock()
+            write_batch_py = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()

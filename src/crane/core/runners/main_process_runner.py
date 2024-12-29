@@ -13,7 +13,7 @@ from typing import Any, Callable, TypeAlias
 from datasets.iterable_dataset import FormattingConfig, IterableDataset
 
 from ..callbacks.base import CallbackManager
-from ..iterables import TimedExamplesIterable
+from ..iterables import FastRebatchedArrowExamplesIterable, TimedExamplesIterable
 from ..monitor import ProgressMonitor, ProgressReport
 from ..utils import clock
 from ..worker import reset_worker_info, set_worker_info
@@ -89,6 +89,8 @@ class MainProcessRunner(BaseRunner):
         # prepare the dataset
         ds = ds._prepare_ex_iterable_for_iteration(batch_size=self._batch_size)
         logger.info(f"Dataset prepared with {num_shards} shards.")
+        # TODO: batch size might be overwritten by call to dataset.map, should at
+        #       least warn user that the specified batch size is not applied
 
         # create the progress monitor
         monitor = ProgressMonitor(num_shards, 1, None, 0)
@@ -136,9 +138,19 @@ class MainProcessRunner(BaseRunner):
                     )
                     work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
 
+                    # replace rebatch operations with fast rebatch
+                    work_iterator = FastRebatchedArrowExamplesIterable.replace_rebatch(
+                        work_iterator
+                    )
+
+                    # create the python iterable that executes the workload
+                    # dynamically use the pyarrow iterable to avoid unnecessary conversion
+                    iter_arrow = (formatting is not None) and (formatting == "arrow")
+                    it = work_iterator.iter_arrow() if iter_arrow else iter(work_iterator)
+
                     # main worker loop
-                    for _ in work_iterator:
-                        num_samples += 1
+                    for _, data in it:
+                        num_samples += data.num_rows if iter_arrow else 1
 
                         now = clock()
                         if now - last_report > self._report_interval:
@@ -162,7 +174,6 @@ class MainProcessRunner(BaseRunner):
                             num_samples, last_report = 0, now
 
                     logger.info(f"Finished processing shard {shard_id}.")
-
                     monitor._mark_worker_completed(0)
 
                 except KeyboardInterrupt:
