@@ -187,14 +187,11 @@ class BaseDatasetWriter(ABC):
         with open(datasets.config.DATASET_STATE_JSON_FILENAME, "w", encoding="utf-8") as state_file:
             json.dump(state, state_file, indent=2, sort_keys=True)
 
-    def _get_write_fn(
-        self, ds: datasets.IterableDataset | datasets.Dataset
-    ) -> tuple[str, Callable]:
+    def _get_write_fn(self, ds: datasets.IterableDataset) -> tuple[str, Callable]:
         """Determine the best format and corresponding write function for the dataset.
 
         Args:
-            ds (datasets.IterableDataset | datasets.Dataset): The dataset or iterable
-                dataset to be written.
+            ds (datasets.IterableDataset): The dataset or iterable dataset to be written.
 
         Returns:
             tuple[str, Callable]: The determined formatting and the bound write function

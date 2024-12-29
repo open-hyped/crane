@@ -131,9 +131,6 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         Yields:
             tuple[Key, pa.Table]: A tuple containing a key and pyarrow table.
         """
-        if self._flag:
-            return
-
         if self._iter is None:
             self.init_iter()
 
@@ -337,6 +334,7 @@ class QueueExamplesIterable(BaseExamplesIterable):
                     metadata = pa_table.schema.metadata
                     key = metadata.pop(b"_key").decode()
                     yield key, pa_table.replace_schema_metadata(metadata=metadata)
+                break
             except Empty:
                 break
 
@@ -463,7 +461,6 @@ class FastRebatchedArrowExamplesIterable(RebatchedArrowExamplesIterable):
         # recover state if present
         if self._state_dict and self._state_dict["previous_state"]:
             self.ex_iterable.load_state_dict(self._state_dict["previous_state"])
-
         # create the iterator over pyarrow tables
         it = (
             self.rebatch_arrow(self.ex_iterable.iter_arrow())
