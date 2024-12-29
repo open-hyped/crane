@@ -10,7 +10,7 @@ import math
 import multiprocessing as mp
 import threading
 from enum import Enum
-from typing import Iterable, TypeAlias, TypedDict
+from typing import Any, Iterable, TypeAlias, TypedDict
 
 from .runners.base import WorkerProcessingStage, WorkerRole
 from .utils import EMA, TimeWeightedEMA, clock
@@ -70,7 +70,12 @@ class ProgressMonitor(object):
     """
 
     def __init__(
-        self, num_shards: int, num_workers: int, queue: mp.Queue | None, item_size: int
+        self,
+        num_shards: int,
+        num_workers: int,
+        queue: mp.Queue | None,
+        item_size: int,
+        update_interval: float = 0.1,
     ) -> None:
         """Initializes the :class:`ProgressMonitor`.
 
@@ -79,6 +84,7 @@ class ProgressMonitor(object):
             num_workers (int): The number of workers processing the data.
             queue (None | mp.Queue): Sample queue filled by producer workers.
             item_size (int): The number of samples contained within a queue item.
+            update_interval (float): The update interval in seconds.
         """
         self._stopping = threading.Event()
         self._done = threading.Event()
@@ -110,10 +116,14 @@ class ProgressMonitor(object):
         ]
         self._num_samples = [{role: 0 for role in WorkerRole} for _ in range(num_workers)]
 
-        self._monitor_thread: None | threading.Thread = None
-        if self._queue is not None:
-            self._monitor_thread = threading.Thread(target=self._monitor_queue)
-            self._monitor_thread.start()
+        self._update_interval = update_interval
+        self._monitor_cache: dict[str, Any] = {
+            role: {"should_update": False, "acc_num_samples": 0, "acc_time_delta": 0.0}
+            for role in WorkerRole
+        }
+        self._monitor_cache_lock = threading.Lock()
+        self._monitor_thread = threading.Thread(target=self._monitor_thread_fn)
+        self._monitor_thread.start()
 
     @property
     def num_shards(self) -> int:
@@ -334,28 +344,49 @@ class ProgressMonitor(object):
 
         return elapsed_times
 
-    def _monitor_queue(self) -> None:
-        """Monitor and track the processing queue over time.
+    def _monitor_thread_fn(self) -> None:
+        """Continuously update and monitor the processing state.
 
-        This method continuously monitors the size of the sample queue used by the workers,
-        updating the time-weighted exponential moving average (EMA) of the queue size. It runs
-        in a separate thread and regularly samples the queue size at short intervals,
-        scaling the queue size by the number of items it can hold (:code:`_item_size`).
+        This method runs in a separate thread at regular intervals defined by
+        :code:`_update_interval`, performing two primary tasks:
 
-        The method will stop monitoring when the :code:`_done` event is set, and handles
-        exceptions that might occur if the queue connection is lost.
+        1. **Updating Monitoring State:**
+           Iterates through worker roles to update the time-weighted exponential moving
+           averages (EMA) of sample counts and time deltas, based on accumulated values in
+           the monitoring cache. The cache is then reset for the next interval.
+
+        2. **Tracking Queue State:**
+           If a queue is available, it calculates the current queue size (scaled by
+           :code:`_item_size`) and updates its EMA over time. This provides a smooth estimate
+           of queue utilization.
+
+        The method stops execution when the :code:`_done` event is set. It also handles
+        exceptions caused by issues in queue connectivity.
 
         Raises:
             BrokenPipeError: If the queue connection is broken.
             ConnectionResetError: If the queue connection is reset.
         """
-        assert self._queue is not None
-
         try:
-            while not self._done.wait(timeout=0.01):
-                # compute queue size and update the moving average
-                qsize = self._queue.qsize() * self._item_size
-                self._ema_queue_size.update(clock(), qsize)
+            while not self._done.wait(timeout=self._update_interval):
+                with self._monitor_cache_lock:
+                    for role in WorkerRole:
+                        if self._monitor_cache[role]["should_update"]:
+                            self._smooth_dn[role].update(
+                                self._monitor_cache[role]["acc_num_samples"]
+                            )
+                            self._smooth_dt[role].update(
+                                self._monitor_cache[role]["acc_time_delta"]
+                            )
+
+                        self._monitor_cache[role]["should_update"] = False
+                        self._monitor_cache[role]["acc_num_samples"] = 0
+                        self._monitor_cache[role]["acc_time_delta"] = 0.0
+
+                if self._queue is not None:
+                    # compute queue size and update the moving average
+                    qsize = self._queue.qsize() * self._item_size
+                    self._ema_queue_size.update(clock(), qsize)
 
         except (BrokenPipeError, ConnectionResetError):  # pragma: not covered
             # queue connection closed
@@ -390,8 +421,10 @@ class ProgressMonitor(object):
         role = self._roles[rank]
         self._num_samples[rank][role] += report["num_samples"]
         # update smooth deltas
-        self._smooth_dn[role].update(report["num_samples"])
-        self._smooth_dt[role].update(ts - self._last_report[role])
+        with self._monitor_cache_lock:
+            self._monitor_cache[role]["should_update"] = True
+            self._monitor_cache[role]["acc_num_samples"] += report["num_samples"]
+            self._monitor_cache[role]["acc_time_delta"] += ts - self._last_report[role]
         self._last_report[role] = ts
 
     def _mark_as_stopping(self) -> None:
@@ -401,10 +434,8 @@ class ProgressMonitor(object):
     def _mark_as_done(self) -> None:
         """Marks the process as done."""
         self._done.set()
-
-        if self._monitor_thread is not None:
-            # wait for the monitor thread to terminate
-            self._monitor_thread.join()
+        # wait for the monitor thread to terminate
+        self._monitor_thread.join()
 
     def _mark_shard_in_progress(self, rank: int, shard_id: int) -> None:
         """Marks a shard as being in progress, associating it with a worker.
