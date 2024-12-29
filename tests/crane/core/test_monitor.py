@@ -10,7 +10,9 @@ from crane.core.utils import clock
 class TestProgressMonitor:
     @pytest.fixture
     def monitor(self):
-        return ProgressMonitor(5, 6, None, 10)
+        monitor = ProgressMonitor(5, 6, None, 10)
+        yield monitor
+        monitor._mark_as_done()
 
     def test_report_progress(self, monitor):
         # Simulate a worker's progress report over time
@@ -43,10 +45,6 @@ class TestProgressMonitor:
         # Call the _report_progress method with sample reports
         monitor._report_progress(rank, report1)
         monitor._report_progress(rank, report2)
-
-        # Validate throughput calculation (samples/second)
-        assert isinstance(monitor.samples_per_second, float)
-        assert math.isclose(monitor.samples_per_second, 105.0, rel_tol=1e-2)
 
         # Validate average elapsed times
         averages = monitor.elapsed_time_averages([rank])

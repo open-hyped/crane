@@ -379,9 +379,9 @@ class ProgressMonitor(object):
                                 self._monitor_cache[role]["acc_time_delta"]
                             )
 
-                        self._monitor_cache[role]["should_update"] = False
-                        self._monitor_cache[role]["acc_num_samples"] = 0
-                        self._monitor_cache[role]["acc_time_delta"] = 0.0
+                            self._monitor_cache[role]["should_update"] = False
+                            self._monitor_cache[role]["acc_num_samples"] = 0
+                            self._monitor_cache[role]["acc_time_delta"] = 0.0
 
                 if self._queue is not None:
                     # compute queue size and update the moving average
