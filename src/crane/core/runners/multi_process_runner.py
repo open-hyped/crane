@@ -32,7 +32,6 @@ from datasets.iterable_dataset import (
     FormattingConfig,
     MappedExamplesIterable,
     RebatchedArrowExamplesIterable,
-    TypedExamplesIterable,
     _BaseExamplesIterable,
     identity_func,
 )
@@ -925,7 +924,6 @@ class DynamicMultiprocessingRunner(BaseRunner):
             (
                 MappedExamplesIterable,
                 FilteredExamplesIterable,
-                TypedExamplesIterable,
                 RebatchedArrowExamplesIterable,
             ),
         ):
@@ -936,7 +934,6 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 (
                     MappedExamplesIterable,
                     FilteredExamplesIterable,
-                    TypedExamplesIterable,
                     RebatchedArrowExamplesIterable,
                 ),
             ):

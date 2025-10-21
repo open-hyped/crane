@@ -26,7 +26,6 @@ from datasets.iterable_dataset import (
     SkipExamplesIterable,
     StepExamplesIterable,
     TakeExamplesIterable,
-    TypedExamplesIterable,
 )
 
 from .callbacks.base import Callback
@@ -202,7 +201,6 @@ class BaseDatasetWriter(ABC):
         while isinstance(
             ex_iterable,
             (
-                TypedExamplesIterable,
                 SelectColumnsIterable,
                 StepExamplesIterable,
                 BufferShuffledExamplesIterable,
