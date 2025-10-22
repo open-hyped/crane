@@ -236,6 +236,16 @@ class Worker(mp.Process):
             bool: Boolean indicating whether the worker accepted the new context.
             If not blocking, it always returns True.
         """
+        # clear connection buffer
+        while self._recv_ctx_resp_conn.poll():
+            self._recv_ctx_resp_conn.recv()
+
+        try:
+            # clear context queue
+            self._ctx_queue.get(timeout=0.1)
+        except Empty:
+            pass
+
         # serialize and send context
         ctx_bytes = dill.dumps(ctx)
         self._ctx_queue.put_nowait(ctx_bytes)
@@ -282,8 +292,8 @@ class Worker(mp.Process):
         self._send_msg(MessageType.CTX_REQUEST)
 
         # wait for new context to be received
-        while (ctx := self._recv_ctx(block=True, timeout=1.0)) is None:
-            pass
+        while (ctx := self._recv_ctx(blocking=True, timeout=1.0)) is None:
+            self._logger.debug("Waiting for worker context...")
 
         # requesting a new context must provide a new data stream
         if (ctx.data_stream is None) and (not ctx.stop):
@@ -292,7 +302,7 @@ class Worker(mp.Process):
 
         return self._apply_ctx(ctx)
 
-    def _recv_ctx(self, block: bool, timeout: float = 1.0) -> WorkerContext | None:
+    def _recv_ctx(self, blocking: bool, timeout: float = 1.0) -> WorkerContext | None:
         """Receive a serialized worker context from the internal context queue.
 
         This method attempts to retrieve a pickled (serialized) worker context object
@@ -304,7 +314,7 @@ class Worker(mp.Process):
         preserved, and only the processing stages are updated.
 
         Args:
-            block (bool): Whether to block while waiting for a context.
+            blocking (bool): Whether to block while waiting for a context.
             timeout (float, optional): Maximum time to wait for a context if blocking.
                 Defaults to 1.0 seconds.
 
@@ -314,7 +324,7 @@ class Worker(mp.Process):
         """
         if self._ctx_queue.qsize() > 0:
             try:
-                ctx_bytes = self._ctx_queue.get(block=block, timeout=timeout)
+                ctx_bytes = self._ctx_queue.get(block=blocking, timeout=timeout)
                 ctx = dill.loads(ctx_bytes)
                 self._logger.debug(f"Received {ctx}.")
                 return ctx
@@ -447,7 +457,7 @@ class Worker(mp.Process):
                             num_samples += data.num_rows if iter_arrow else 1
 
                             # check if the worker was asked to apply a new context
-                            if (ctx := self._recv_ctx(block=False)) is not None:
+                            if (ctx := self._recv_ctx(blocking=False)) is not None:
                                 self._logger.debug("Detected context update request.")
 
                                 if ctx.data_stream is not None:

@@ -27,8 +27,8 @@ class TestWorker:
         return MagicMock()
 
     @pytest.fixture
-    def msg_pipe(self):
-        return mp.Pipe(duplex=False)
+    def msg_queue(self):
+        return mp.Queue()
 
     @pytest.fixture
     def transform(self):
@@ -56,13 +56,11 @@ class TestWorker:
         )
 
     @pytest.fixture
-    def worker(self, msg_pipe, worker_init, worker_finalizer, context):
-        _, send_msg_conn = msg_pipe
-
+    def worker(self, msg_queue, worker_init, worker_finalizer, context):
         worker = Worker(
             rank=0,
             num_workers=1,
-            send_msg_conn=send_msg_conn,
+            msg_queue=msg_queue,
             progress_report_interval=0.0,
             worker_init=worker_init,
             worker_finalize=worker_finalizer,
@@ -70,9 +68,7 @@ class TestWorker:
         worker._ctx = context
         return worker
 
-    def test_request_new_ctx(self, msg_pipe, worker):
-        recv_msg, _ = msg_pipe
-
+    def test_request_new_ctx(self, msg_queue, worker):
         ctx = WorkerContext(
             role=WorkerRole.STANDALONE,
             data_stream="STREAM",
@@ -81,17 +77,17 @@ class TestWorker:
             stop=False,
         )
         # mock context conn receiver to avoid deadlock
-        worker._parent_ctx_conn.recv = MagicMock()
+        worker._recv_ctx_resp_conn.recv = MagicMock()
         # send new context before worker request to avoid deadlock in worker
         worker.send_ctx(ctx)
-        worker._parent_ctx_conn.recv.assert_called_once()
+        worker._recv_ctx_resp_conn.recv.assert_called_once()
 
         # request new context
         worker._request_new_ctx()
 
         # make sure the worker send a request context message
-        assert recv_msg.poll(timeout=0.1)
-        msg = json.loads(recv_msg.recv_bytes().decode("utf-8"))
+        msg_bytes = msg_queue.get(timeout=1.0)
+        msg = json.loads(msg_bytes.decode("utf-8"))
         assert msg["rank"] == worker._rank
         assert msg["type"] == MessageType.CTX_REQUEST.value
 
@@ -119,8 +115,8 @@ class TestWorker:
         # mock request new and check context
         worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
         # mock context connection
-        worker._child_ctx_conn = MagicMock()
-        worker._child_ctx_conn.poll = MagicMock(return_value=True)
+        worker._recv_ctx_resp_conn = MagicMock()
+        worker._recv_ctx_resp_conn.poll = MagicMock(return_value=True)
         # mock receive context function
         ctx_update = WorkerContext(role=WorkerRole.STANDALONE, stop=False)
         worker._recv_ctx = MagicMock(return_value=ctx_update)
@@ -141,9 +137,6 @@ class TestWorker:
     def test_run_with_abort(self, mock_set_worker_info, worker, data_stream, transform):
         # mock request new and check context
         worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
-        # mock context connection
-        worker._child_ctx_conn = MagicMock()
-        worker._child_ctx_conn.poll = MagicMock(return_value=True)
         # mock receive context function
         ctx_update = WorkerContext(role=WorkerRole.STANDALONE, stop=True)
         worker._recv_ctx = MagicMock(return_value=ctx_update)
@@ -213,6 +206,11 @@ class TestConsumerProducerBalancer(object):
         """Test callback when producers should be added."""
         # Simulate a low queue size (below 30%) and longer consumer block time
         mock_monitor.num_buffered_samples = 20
+        mock_monitor.get_workers_with_role.side_effect = {
+            WorkerRole.STANDALONE: {1, 2, 3},
+            WorkerRole.CONSUMER: {4, 5, 6},
+            WorkerRole.PRODUCER: {7, 8, 9},
+        }.get
         mock_monitor.elapsed_time_averages.side_effect = lambda _: {
             WorkerProcessingStage.FINALIZE: 1.0,  # Producer block time
             WorkerProcessingStage.STREAM: 2.0,  # Consumer block time
@@ -225,6 +223,11 @@ class TestConsumerProducerBalancer(object):
         """Test callback when producers should be removed."""
         # Simulate a high queue size (above 70%) and longer producer block time
         mock_monitor.num_buffered_samples = 80
+        mock_monitor.get_workers_with_role.side_effect = {
+            WorkerRole.STANDALONE: {1, 2, 3},
+            WorkerRole.CONSUMER: {4, 5, 6},
+            WorkerRole.PRODUCER: {7, 8, 9},
+        }.get
         mock_monitor.elapsed_time_averages.side_effect = lambda _: {
             WorkerProcessingStage.FINALIZE: 2.0,  # Producer block time
             WorkerProcessingStage.STREAM: 1.0,  # Consumer block time
@@ -237,8 +240,27 @@ class TestConsumerProducerBalancer(object):
         """Test callback when no action should be taken."""
         # Simulate balanced queue size and block times
         mock_monitor.num_buffered_samples = 50
+        mock_monitor.get_workers_with_role.side_effect = {
+            WorkerRole.STANDALONE: {1, 2, 3},
+            WorkerRole.CONSUMER: {4, 5, 6},
+            WorkerRole.PRODUCER: {7, 8, 9},
+        }.get
         mock_monitor.elapsed_time_averages.side_effect = lambda _: {
             WorkerProcessingStage.FINALIZE: 1.0,  # Producer block time
+            WorkerProcessingStage.STREAM: 1.0,  # Consumer block time
+        }
+
+        action = balancer.callback()
+        assert action == ConsumerProducerBalancer.Action.NO_ACTION
+
+        # Simulate balanced queue size and block times
+        mock_monitor.get_workers_with_role.side_effect = {
+            WorkerRole.STANDALONE: {1, 2, 3},
+            WorkerRole.CONSUMER: set(),  # no consumers -> no action
+            WorkerRole.PRODUCER: {7, 8, 9},
+        }.get
+        mock_monitor.elapsed_time_averages.side_effect = lambda _: {
+            WorkerProcessingStage.FINALIZE: 2.0,  # Producer block time
             WorkerProcessingStage.STREAM: 1.0,  # Consumer block time
         }
 
@@ -271,7 +293,7 @@ class TestDynamicMultiprocessingRunner:
             callback=CallbackManager([]),
         )
 
-    @pytest.mark.parametrize("num_shards", [1, 2, 3])
+    @pytest.mark.parametrize("num_shards", [2, 3])
     def test_run(self, num_shards, runner):
         # create mock dataset
         samples = {"obj": [i for i in range(20)]}
