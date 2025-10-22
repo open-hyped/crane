@@ -1,4 +1,5 @@
 import math
+from unittest.mock import patch
 
 import pytest
 
@@ -44,9 +45,11 @@ class TestProgressMonitor:
         monitor._report_progress(rank, report1)
         monitor._report_progress(rank, report2)
 
-        # Validate throughput calculation (samples/second)
-        assert isinstance(monitor.samples_per_second, float)
-        assert math.isclose(monitor.samples_per_second, 105.0, rel_tol=1e-2)
+        # patch clock for reproducability
+        with patch("crane.core.monitor.clock", lambda: now + 3.0):
+            # Validate throughput calculation (samples/second)
+            assert isinstance(monitor.samples_per_second, float)
+            assert math.isclose(monitor.samples_per_second, 136.5, rel_tol=1e-2)
 
         # Validate average elapsed times
         averages = monitor.elapsed_time_averages([rank])

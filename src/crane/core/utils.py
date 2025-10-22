@@ -191,6 +191,28 @@ class EMA(object):
         )
         self.calls += 1
 
+    def peek(self, value: float) -> float:
+        """Compute the next EMA value for a given input without updating the internal state.
+
+        This method calculates what the EMA *would be* if the given value were
+        incorporated, but does not modify the stored EMA or call count.
+
+        Args:
+            value (float): The new input value to hypothetically include.
+
+        Returns:
+            float: The predicted next EMA value (bias-corrected).
+        """
+        beta = 1 - self.alpha
+        if self.last_ema is None:
+            next_ema = value
+            calls = 1
+        else:
+            next_ema = self.alpha * value + beta * self.last_ema
+            calls = self.calls + 1
+
+        return next_ema / (1 - beta**calls)
+
 
 class TimeWeightedEMA(object):
     r"""Calculate the time-weighted exponential moving average (EMA).

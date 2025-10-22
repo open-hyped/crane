@@ -65,6 +65,9 @@ def test_calculate_ema():
     # Verify the calculated EMA against an expected value
     assert math.isclose(ema.value, 228.12212133175416, rel_tol=1e-5)
 
+    # Test peek functionality
+    assert math.isclose(ema.peek(300), 254.0418064019809, rel_tol=1e-5)
+
 
 def test_calculate_time_weighted_ema():
     measurements = {

@@ -255,13 +255,24 @@ class ProgressMonitor(object):
             float: The calculated throughput, representing the number of processed
             samples per unit of time.
         """
-        return (
-            self._smooth_dn[WorkerRole.STANDALONE].value
-            / max(self._smooth_dt[WorkerRole.STANDALONE].value, 1e-5)
-        ) + (
-            self._smooth_dn[WorkerRole.CONSUMER].value
-            / max(self._smooth_dt[WorkerRole.CONSUMER].value, 1e-5)
+        now = clock()
+
+        # Time elapsed since last report for each role
+        standalone_dt = now - self._last_report[WorkerRole.STANDALONE]
+        consumer_dt = now - self._last_report[WorkerRole.CONSUMER]
+
+        # Smoothed throughput estimates using peek to avoid updating EMAs
+        standalone_throughput = self._smooth_dn[WorkerRole.STANDALONE].value / max(
+            self._smooth_dt[WorkerRole.STANDALONE].peek(standalone_dt), 1e-5
         )
+
+        consumer_throughput = self._smooth_dn[WorkerRole.CONSUMER].value / max(
+            self._smooth_dt[WorkerRole.CONSUMER].peek(consumer_dt), 1e-5
+        )
+
+        # Total combined throughput
+        total_throughput = standalone_throughput + consumer_throughput
+        return total_throughput
 
     def get_worker_shard(self, rank: int) -> None | int:
         """Retrieves the shard currently assigned to the worker.
