@@ -21,6 +21,7 @@ import traceback
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
+from queue import Empty
 from typing import Any, Callable, Iterable, TypeAlias
 
 import dill
@@ -179,7 +180,7 @@ class Worker(mp.Process):
         self,
         rank: int,
         num_workers: int,
-        send_msg_conn: mp.connection.Connection,
+        msg_queue: mp.Queue,
         progress_report_interval: float,
         worker_init: Callable[[], Any],
         worker_finalize: Callable[[], Any],
@@ -191,8 +192,7 @@ class Worker(mp.Process):
                 the worker's position or role in the set of workers.
             num_workers (int): The total number of workers involved in the data
                 processing pipeline.
-            send_msg_conn (mp.connection.Connection): A connection object used to send messages
-                to the manager process.
+            msg_queue (mp.Queue): A queue object used to send messages to the manager process.
             progress_report_interval (float): The time interval, in seconds, between sending
                 progress updates.
             worker_init (Callable[[], Any]): A callable function to initialize the worker's
@@ -205,8 +205,9 @@ class Worker(mp.Process):
         self._rank = rank
         self._num_workers = num_workers
         # connections
-        self._send_msg_conn = send_msg_conn
-        self._parent_ctx_conn, self._child_ctx_conn = mp.Pipe(duplex=True)
+        self._msg_queue = msg_queue
+        self._ctx_queue = mp.Queue(maxsize=1)
+        self._recv_ctx_resp_conn, self._send_ctx_resp_conn = mp.Pipe(duplex=False)
         # rate limit for progress updates
         self._progress_report_interval = progress_report_interval
         # worker initializer and finalizer
@@ -235,16 +236,13 @@ class Worker(mp.Process):
             bool: Boolean indicating whether the worker accepted the new context.
             If not blocking, it always returns True.
         """
-        # clear connection
-        while self._parent_ctx_conn.poll():
-            self._parent_ctx_conn.recv()
-
         # serialize and send context
-        self._parent_ctx_conn.send_bytes(dill.dumps(ctx))
+        ctx_bytes = dill.dumps(ctx)
+        self._ctx_queue.put_nowait(ctx_bytes)
 
         if blocking:
             # wait for feedback from worker
-            accepted = self._parent_ctx_conn.recv()
+            accepted = self._recv_ctx_resp_conn.recv()
             # log
             accept_str = "accpeted" if accepted else "refused"
             self._logger.debug(f"Sent new context to worker {self._rank}, worker {accept_str}.")
@@ -271,7 +269,7 @@ class Worker(mp.Process):
         msg = {"rank": self._rank, "type": msg_type.value, "payload": payload}
 
         msg = orjson.dumps(msg)
-        self._send_msg_conn.send_bytes(msg)
+        self._msg_queue.put(msg)
 
     def _request_new_ctx(self) -> bool:
         """Request new processing context from the main process.
@@ -284,38 +282,47 @@ class Worker(mp.Process):
         self._send_msg(MessageType.CTX_REQUEST)
 
         # wait for new context to be received
-        ctx = self._recv_ctx()
+        while (ctx := self._recv_ctx(block=True, timeout=1.0)) is None:
+            pass
 
         # requesting a new context must provide a new data stream
         if (ctx.data_stream is None) and (not ctx.stop):
-            self._child_ctx_conn.send(False)
+            self._send_ctx_resp_conn.send(False)
             return self._request_new_ctx()
 
         return self._apply_ctx(ctx)
 
-    def _recv_ctx(self) -> WorkerContext:
-        """Receive a worker context from the context connection.
+    def _recv_ctx(self, block: bool, timeout: float = 1.0) -> WorkerContext | None:
+        """Receive a serialized worker context from the internal context queue.
 
-        This method receives a new processing context from the worker's connection,
-        updating the worker's pipeline with the new producer, processor, and finalizer
-        functions. If :code:`keep_producer` is :code:`True`, the current producer is
+        This method attempts to retrieve a pickled (serialized) worker context object
+        from the internal context queue (:code:`_ctx_queue`). The context is deserialized
+        using :code:`dill` and returned. If no context is available within the specified
+        timeout, the method returns `None`.
+
+        If :code:`keep_producer` is :code:`True`, the current producer is
         preserved, and only the processing stages are updated.
 
+        Args:
+            block (bool): Whether to block while waiting for a context.
+            timeout (float, optional): Maximum time to wait for a context if blocking.
+                Defaults to 1.0 seconds.
+
         Returns:
-            WorkerContext: The received context.
+            WorkerContext | None: The deserialized worker context if available,
+            otherwise `None`.
         """
-        # wait for new context
-        while not self._child_ctx_conn.poll(timeout=1.0):
-            self._logger.debug("Waiting for new context...")
+        if self._ctx_queue.qsize() > 0:
+            try:
+                ctx_bytes = self._ctx_queue.get(block=block, timeout=timeout)
+                ctx = dill.loads(ctx_bytes)
+                self._logger.debug(f"Received {ctx}.")
+                return ctx
+            except Empty:
+                pass
 
-        # receive context
-        while self._child_ctx_conn.poll():
-            ctx = self._child_ctx_conn.recv_bytes()
-        # deserialize context
-        ctx = dill.loads(ctx)
-        self._logger.debug(f"Received {ctx}.")
-
-        return ctx
+        self._logger.debug("No worker context received.")  # TODO
+        return None
 
     def _apply_ctx(self, ctx: WorkerContext) -> bool:
         """Apply context to the worker.
@@ -334,7 +341,7 @@ class Worker(mp.Process):
         """
         # apply the context to the worker context
         self._ctx.apply_ctx(ctx)
-        self._child_ctx_conn.send(True)
+        self._send_ctx_resp_conn.send(True)
         # log
         self._logger.debug(f"Applied {self._ctx}")
 
@@ -440,15 +447,12 @@ class Worker(mp.Process):
                             num_samples += data.num_rows if iter_arrow else 1
 
                             # check if the worker was asked to apply a new context
-                            if self._child_ctx_conn.poll():
+                            if (ctx := self._recv_ctx(block=False)) is not None:
                                 self._logger.debug("Detected context update request.")
-
-                                # receive and unpack context
-                                ctx = self._recv_ctx()
 
                                 if ctx.data_stream is not None:
                                     # new context not accepted
-                                    self._child_ctx_conn.send(False)
+                                    self._send_ctx_resp_conn.send(False)
 
                                 elif ctx.stop:
                                     # stop worker
@@ -549,8 +553,8 @@ class Worker(mp.Process):
                     },
                 )
 
-        # send done message
-        self._send_msg(MessageType.DONE)
+            # send done message
+            self._send_msg(MessageType.DONE)
 
 
 class WorkerController(object):
@@ -573,7 +577,7 @@ class WorkerController(object):
         self.workers = workers
         self.queue = mp.Manager().Queue(maxsize=self.num_workers)
         self.queue_it = QueueExamplesIterable(
-            self.queue, sentinel=None, timeout=1.0, num_shards=num_shards
+            self.queue, sentinel=None, timeout=30.0, num_shards=num_shards
         )
         self.standalone_ranks = set()
         self.producer_ranks = set()
@@ -820,6 +824,11 @@ class ConsumerProducerBalancer(object):
         # get registered producer and consumer workers
         registered_producer_workers = self._monitor.get_workers_with_role(WorkerRole.PRODUCER)
         registered_consumer_workers = self._monitor.get_workers_with_role(WorkerRole.CONSUMER)
+
+        # only balance producers if there are consumers
+        if len(registered_consumer_workers) == 0:
+            return ConsumerProducerBalancer.Action.NO_ACTION
+
         # get the average block times for producer and consumer group
         producer_block_time = self._monitor.elapsed_time_averages(registered_producer_workers)[
             Stages.FINALIZE
@@ -968,7 +977,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         finalizer: Callable[[Any], Any],
         finalizer_batch_size: None | int,
         finalizer_formatting: None | FormattingConfig,
-        recv_msg_conn: mp.connection.Connection,
+        msg_queue: mp.Queue,
         monitor: ProgressMonitor,
         controller: WorkerController,
         balancer: ConsumerProducerBalancer,
@@ -988,8 +997,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 after it has been transformed.
             finalizer_batch_size (int | None): The finalizer batch size.
             finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
-            recv_msg_conn (mp.connection.Connection): The connection object used to receive messages
-                from worker processes.
+            msg_queue (mp.Queue): The queue used to receive messages from worker processes.
             monitor (ProgressMonitor): An object responsible for tracking the progress and state
                 of the workers and the overall processing.
             controller (WorkerController): The controller managing worker assignments and roles.
@@ -1008,7 +1016,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         done = False
         while not done:
             # receive message from worker
-            msg = recv_msg_conn.recv_bytes()
+            msg = msg_queue.get()
             msg = orjson.loads(msg)
             # unpack message
             rank: int = msg["rank"]
@@ -1183,14 +1191,14 @@ class DynamicMultiprocessingRunner(BaseRunner):
         src_ds, transform = self._prepare_dataset(ds)
         self._logger.info(f"Dataset prepared with {num_shards} shards.")
 
-        # create connection for workers to request new context
-        recv_msg_conn, worker_msg_conn = mp.Pipe(duplex=False)
+        # create a worker message queue
+        msg_queue = mp.Queue()
         # create all workers
         workers = [
             Worker(
                 rank=rank,
                 num_workers=self._num_workers,
-                send_msg_conn=worker_msg_conn,
+                msg_queue=msg_queue,
                 progress_report_interval=self._report_interval,
                 worker_init=self._worker_init,
                 worker_finalize=self._worker_finalize,
@@ -1212,7 +1220,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         # bind handle message loop to all arguments
         message_handler = partial(
             self._handle_message_loop,
-            recv_msg_conn=recv_msg_conn,
+            msg_queue=msg_queue,
             src_ds=src_ds,
             transform=transform,
             finalizer=finalizer,
