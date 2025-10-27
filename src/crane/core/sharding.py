@@ -11,15 +11,19 @@ import multiprocessing as mp
 import warnings
 from collections import OrderedDict
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, TypeAlias, TypeVar
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from .utils import FormatType
+
 logger = logging.getLogger(__name__)
 
+BatchT: TypeAlias = pa.Table | dict[str, list[Any]]
 
-def _parse_size(size_str: str) -> int:
+
+def _parse_size_str(size_str: str) -> int:
     """Convert a string representation of size to bytes.
 
     Args:
@@ -88,6 +92,16 @@ class ShardingStrategy(str, Enum):
     """
 
 
+GET_BATCH_SIZE_FN_MAPPING: dict[
+    tuple[FormatType, ShardingStrategy], Callable[[BatchT, str], int]
+] = {
+    (FormatType.ARROW, ShardingStrategy.SAMPLE_ITEM): lambda b, k: pc.sum(b.column(k)).as_py(),
+    (FormatType.ARROW, ShardingStrategy.SAMPLE_COUNT): lambda b, k: b.num_rows,
+    (FormatType.PYTHON, ShardingStrategy.SAMPLE_ITEM): lambda b, k: sum(b[k]),
+    (FormatType.PYTHON, ShardingStrategy.SAMPLE_COUNT): lambda b, k: len(next(iter(b.values()))),
+}
+
+
 class ShardingController(object):
     """Controller responsible for managing dataset sharding during the writing process.
 
@@ -104,6 +118,7 @@ class ShardingController(object):
         sample_size_key: None | str,
         initialize_shard: Callable[[int], Any],
         finalize_shard: Callable[[int], Any],
+        formatting: FormatType,
     ) -> None:
         """Initialize the :class:`ShardingController`.
 
@@ -119,9 +134,8 @@ class ShardingController(object):
                 :class:`SAMPLE_ITEM` strategy.
             initialize_shard (Callable[[int], Any]): A function to initialize a new shard.
             finalize_shard (Callable[[int], Any]): A function to finalize the current shard.
+            formatting (FormatType): The formatting of the batches.
         """
-        global _manager
-
         if (sharding_strategy is not ShardingStrategy.SAMPLE_ITEM) and (
             sample_size_key is not None
         ):
@@ -147,9 +161,10 @@ class ShardingController(object):
 
         if isinstance(max_shard_size, str):
             # parse the size string to an integer
-            max_shard_size = _parse_size(max_shard_size)
+            max_shard_size = _parse_size_str(max_shard_size)
 
         self._is_multi_processed = is_multi_processed
+        self._formatting = formatting
         # sharding strategy
         self._sharding_strategy = sharding_strategy
         self._max_shard_size = max_shard_size
@@ -158,7 +173,10 @@ class ShardingController(object):
         self._shard_id: None | int = None
         self._shard_size = 0
         self._shard_bytes = 0
-        self._sample_size = 0
+        self._batch_size = 0
+        self._batch_size_fn = GET_BATCH_SIZE_FN_MAPPING.get(
+            (formatting, sharding_strategy), lambda b, k: 0
+        )
         # global shard state
         if is_multi_processed:
             manager = mp.Manager()
@@ -202,20 +220,20 @@ class ShardingController(object):
         self._shard_id = None
         self._shard_size = 0
         self._shard_bytes = 0
-        self._sample_size = 0
+        self._batch_size = 0
 
-    def callback(self, batch: pa.Table) -> pa.Table:
+    T = TypeVar("T", pa.Table, dict[str, list[Any]])
+
+    def callback(self, batch: T | dict[str, list[Any]]) -> T:
         """Process each batch before writing and check if a new shard is required.
 
         Args:
-            batch (pa.Table): The batch of samples.
+            batch (pa.Table | dict[str, list[Any]]): The batch of samples.
 
         Returns:
-            pa.Table: The batch, unchanged.
+            pa.Table | dict[str, list[Any]]: The batch, unchanged.
         """
-        if self._sharding_strategy is ShardingStrategy.SAMPLE_ITEM:
-            # cache the size of the sample to be used later in the shard size update
-            self._sample_size = pc.sum(batch.column(self._sample_size_key)).as_py()
+        self._batch_size = self._batch_size_fn(batch, self._sample_size_key)
 
         # check if shard is full
         if self._shard_size >= self._max_shard_size:
@@ -234,9 +252,9 @@ class ShardingController(object):
         # udpate shard size according to the strategy
         self._shard_bytes += num_bytes
         self._shard_size += (
-            1
+            self._batch_size
             if self._sharding_strategy is ShardingStrategy.SAMPLE_COUNT
-            else self._sample_size
+            else self._batch_size
             if self._sharding_strategy is ShardingStrategy.SAMPLE_ITEM
             else num_bytes
             if self._sharding_strategy is ShardingStrategy.FILE_SIZE

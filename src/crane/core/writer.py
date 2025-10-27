@@ -31,7 +31,7 @@ from datasets.iterable_dataset import (
 from .callbacks.base import Callback
 from .consumer import DatasetConsumer
 from .sharding import ShardingController, ShardingStrategy
-from .utils import Compose, RunAll, chdir
+from .utils import Compose, FormatType, RunAll, chdir
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class BaseDatasetWriter(ABC):
     overhead.
     """
 
-    SUPPORTED_FORMATS: ClassVar[dict[str, Callable[[Any], int]]] = dict()
+    SUPPORTED_FORMATS: ClassVar[dict[FormatType, Callable[[Any], int]]] = dict()
 
     def __init_subclass__(cls, **kwargs):
         """Check for supported formats."""
@@ -79,9 +79,9 @@ class BaseDatasetWriter(ABC):
         cls.SUPPORTED_FORMATS = {}
         # Detect supported formats by checking if the methods are overridden
         if cls.write_batch_py != BaseDatasetWriter.write_batch_py:
-            cls.SUPPORTED_FORMATS["python"] = cls.write_batch_py
+            cls.SUPPORTED_FORMATS[FormatType.PYTHON] = cls.write_batch_py
         if cls.write_batch_arrow != BaseDatasetWriter.write_batch_arrow:
-            cls.SUPPORTED_FORMATS["arrow"] = cls.write_batch_arrow
+            cls.SUPPORTED_FORMATS[FormatType.ARROW] = cls.write_batch_arrow
         # Ensure at least one method is implemented
         if len(cls.SUPPORTED_FORMATS) == 0:
             raise TypeError(
@@ -211,18 +211,19 @@ class BaseDatasetWriter(ABC):
             ex_iterable = ex_iterable.ex_iterable
         # use arrow format if the underlying iterable yields arrow tables
         if isinstance(ds._ex_iterable, (ArrowExamplesIterable, RebatchedArrowExamplesIterable)):
-            ds = ds.with_format(type="arrow")
+            ds = ds.with_format(type=FormatType.ARROW.value)
 
         supported_formats = type(self).SUPPORTED_FORMATS
-        # Get the dataset formatting
-        formatting = ds._formatting
-        formatting = formatting.format_type if formatting is not None else "python"
+
         # Get the fallback formatting in case the dataset formatting is not supported
         fallback_formatting = next(iter(supported_formats.keys()))
-        fallback_write_fn = supported_formats[fallback_formatting]
-        # Determine the formatting to use for the write operation
+        # Get the dataset formatting
+        formatting = ds._formatting
+        formatting = formatting.format_type if formatting is not None else fallback_formatting
+        formatting = FormatType(formatting) if formatting in FormatType else fallback_formatting
+        # Check if the formatting is supported by the writer
         formatting = formatting if formatting in supported_formats else fallback_formatting
-        write_fn = supported_formats.get(formatting, fallback_write_fn)
+        write_fn = supported_formats[formatting]
         return formatting, write_fn.__get__(self, type(self))
 
     def _write_dataset(
@@ -261,6 +262,7 @@ class BaseDatasetWriter(ABC):
             sample_size_key=self._sample_size_key,
             initialize_shard=partial(self.initialize_shard, info=ds.info),
             finalize_shard=partial(self.finalize_shard, info=ds.info),
+            formatting=formatting,
         )
 
         # wrap write function in sharding callback if needed

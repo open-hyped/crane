@@ -6,6 +6,7 @@ of iterables and queues, offering more flexible control over iteration.
 import math
 import os
 from contextlib import contextmanager
+from enum import Enum
 from functools import reduce
 from time import perf_counter
 from typing import Any, Callable, Generator
@@ -35,6 +36,13 @@ def chdir(new_dir: str) -> Generator[None, None, None]:
         yield  # Yield control back to the caller
     finally:
         os.chdir(original_dir)  # Restore the original directory
+
+
+class FormatType(str, Enum):
+    """Enumeration of supported dataset formatting backends."""
+
+    PYTHON = "python"
+    ARROW = "arrow"
 
 
 class Compose(object):

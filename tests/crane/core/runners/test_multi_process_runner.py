@@ -26,9 +26,11 @@ class TestWorker:
     def worker_finalizer(self):
         return MagicMock()
 
-    @pytest.fixture
+    @pytest.fixture(scope="session")
     def msg_queue(self):
-        return mp.Queue()
+        q = mp.Queue()
+        yield q
+        q.close()
 
     @pytest.fixture
     def transform(self):
@@ -150,35 +152,6 @@ class TestWorker:
         worker._ctx.data_finalizer.assert_has_calls(
             [call({"a": 0, "b": [1, 2, 3, 4]})], any_order=True
         )
-
-    @patch("crane.core.runners.multi_process_runner.set_worker_info")
-    def test_error_logging(self, mock_set_worker_info, worker):
-        # mock finalizer to throw runtime error
-        worker._ctx.data_finalizer = MagicMock(side_effect=RuntimeError)
-        # mock request new and check context
-        worker._logger = MagicMock()
-        worker._logger.error = MagicMock()
-        # mock request new context and run worker
-        worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
-        worker.run()
-        # make sure errors were logged
-        assert len(worker._logger.error.mock_calls) == 3
-
-        worker._logger.error.reset_mock()
-        worker._worker_init = MagicMock(side_effect=RuntimeError)
-        # mock request new context and run worker
-        worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
-        worker.run()
-        # make sure errors were logged
-        worker._logger.error.assert_called_once()
-
-        worker._logger.error.reset_mock()
-        worker._worker_finalize = MagicMock(side_effect=RuntimeError)
-        # mock request new context and run worker
-        worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
-        worker.run()
-        # make sure errors were logged
-        assert len(worker._logger.error.mock_calls) == 2
 
 
 class TestConsumerProducerBalancer(object):

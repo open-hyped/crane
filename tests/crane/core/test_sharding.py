@@ -3,43 +3,44 @@ from unittest.mock import MagicMock
 import pyarrow as pa
 import pytest
 
-from crane.core.sharding import ShardingController, ShardingStrategy, _parse_size
+from crane.core.sharding import ShardingController, ShardingStrategy, _parse_size_str
+from crane.core.utils import FormatType
 
 
 class TestParseSize:
-    def test_parse_size_valid_units(self):
-        assert _parse_size("5GB") == 5 * 1024**3
-        assert _parse_size("200MB") == 200 * 1024**2
-        assert _parse_size("1.5KB") == int(1.5 * 1024)
-        assert _parse_size("2TB") == 2 * 1024**4
-        assert _parse_size("300B") == 300
+    def test_parse_size_str_valid_units(self):
+        assert _parse_size_str("5GB") == 5 * 1024**3
+        assert _parse_size_str("200MB") == 200 * 1024**2
+        assert _parse_size_str("1.5KB") == int(1.5 * 1024)
+        assert _parse_size_str("2TB") == 2 * 1024**4
+        assert _parse_size_str("300B") == 300
 
-    def test_parse_size_with_spaces(self):
-        assert _parse_size(" 5 GB ") == 5 * 1024**3
-        assert _parse_size(" 200 MB") == 200 * 1024**2
-        assert _parse_size("1.5 KB") == int(1.5 * 1024)
+    def test_parse_size_str_with_spaces(self):
+        assert _parse_size_str(" 5 GB ") == 5 * 1024**3
+        assert _parse_size_str(" 200 MB") == 200 * 1024**2
+        assert _parse_size_str("1.5 KB") == int(1.5 * 1024)
 
-    def test_parse_size_invalid_units(self):
+    def test_parse_size_str_invalid_units(self):
         with pytest.raises(ValueError):
-            _parse_size("5XYZ")
+            _parse_size_str("5XYZ")
         with pytest.raises(ValueError):
-            _parse_size("NotASize")
+            _parse_size_str("NotASize")
 
-    def test_parse_size_invalid_value(self):
+    def test_parse_size_str_invalid_value(self):
         with pytest.raises(ValueError):
-            _parse_size("abcMB")
+            _parse_size_str("abcMB")
         with pytest.raises(ValueError):
-            _parse_size("5.5.5GB")
+            _parse_size_str("5.5.5GB")
 
-    def test_parse_size_edge_cases(self):
-        assert _parse_size("0KB") == 0
-        assert _parse_size("0B") == 0
-
-        with pytest.raises(ValueError):
-            _parse_size("")
+    def test_parse_size_str_edge_cases(self):
+        assert _parse_size_str("0KB") == 0
+        assert _parse_size_str("0B") == 0
 
         with pytest.raises(ValueError):
-            _parse_size("   ")
+            _parse_size_str("")
+
+        with pytest.raises(ValueError):
+            _parse_size_str("   ")
 
 
 class TestShardingController:
@@ -54,6 +55,7 @@ class TestShardingController:
             sample_size_key=None,
             initialize_shard=initialize_shard,
             finalize_shard=finalize_shard,
+            formatting=FormatType.PYTHON,
         )
 
         assert controller._is_multi_processed is True
@@ -73,6 +75,7 @@ class TestShardingController:
                 sample_size_key=None,
                 initialize_shard=initialize_shard,
                 finalize_shard=finalize_shard,
+                formatting=FormatType.PYTHON,
             )
 
     def test_initialization_invalid_max_shard_size_for_non_file_size(self):
@@ -87,6 +90,7 @@ class TestShardingController:
                 sample_size_key="key",
                 initialize_shard=initialize_shard,
                 finalize_shard=finalize_shard,
+                formatting=FormatType.PYTHON,
             )
 
     def test_warning_on_sample_size_key_for_non_sample_item(self):
@@ -101,6 +105,7 @@ class TestShardingController:
                 sample_size_key="key",
                 initialize_shard=initialize_shard,
                 finalize_shard=finalize_shard,
+                formatting=FormatType.PYTHON,
             )
 
     @pytest.mark.parametrize("is_multi_processed", [True, False])
@@ -115,6 +120,7 @@ class TestShardingController:
             sample_size_key=None,
             initialize_shard=initialize_shard,
             finalize_shard=finalize_shard,
+            formatting=FormatType.PYTHON,
         )
 
         for i in range(3):
@@ -151,6 +157,7 @@ class TestShardingController:
             sample_size_key=None,
             initialize_shard=initialize_shard,
             finalize_shard=finalize_shard,
+            formatting=FormatType.PYTHON,
         )
         # initialize the controller
         controller.initialize()
@@ -158,15 +165,15 @@ class TestShardingController:
         initialize_shard.reset_mock()
         finalize_shard.reset_mock()
 
-        for _ in range(max_shard_size):
-            controller.callback([{}])
+        for _ in range(max_shard_size // 2):
+            controller.callback({"key": [42] * 2})
             controller.update(42)
             # no new shard needed to be generated yet
             assert not finalize_shard.called
             assert not initialize_shard.called
 
         # this update should kick of a new shard
-        controller.callback([{}])
+        controller.callback({"key": [42] * 2})
         controller.update(42)
 
         finalize_shard.assert_called_once()
@@ -184,6 +191,7 @@ class TestShardingController:
             sample_size_key="key",
             initialize_shard=initialize_shard,
             finalize_shard=finalize_shard,
+            formatting=FormatType.ARROW,
         )
         # initialize the controller
         controller.initialize()
@@ -219,6 +227,7 @@ class TestShardingController:
             sample_size_key=None,
             initialize_shard=initialize_shard,
             finalize_shard=finalize_shard,
+            formatting=FormatType.PYTHON,
         )
         # initialize the controller
         controller.initialize()
@@ -227,14 +236,14 @@ class TestShardingController:
         finalize_shard.reset_mock()
 
         for _ in range(max_shard_size // 42 + 1):
-            controller.callback([{}])
+            controller.callback({"key": [0]})
             controller.update(42)
             # no new shard needed to be generated yet
             assert not finalize_shard.called
             assert not initialize_shard.called
 
         # this update should kick of a new shard
-        controller.callback([{}])
+        controller.callback({"key": [0]})
         controller.update(42)
 
         finalize_shard.assert_called_once()
