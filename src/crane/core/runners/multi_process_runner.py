@@ -225,6 +225,19 @@ class Worker(mp.Process):
             f"Created worker with rank {self._rank} of {self._num_workers} total workers."
         )
 
+    def close(self) -> None:
+        """Close the Process object.
+
+        This method releases resources held by the Process object.  It is
+        an error to call this method if the child process is still running.
+        """
+        # close connections and queues
+        self._recv_ctx_resp_conn.close()
+        self._send_ctx_resp_conn.close()
+        self._ctx_queue.close()
+        # close worker process
+        super(Worker, self).close()
+
     def send_ctx(self, ctx: WorkerContext, blocking: bool = True) -> bool:
         """Send new processing context to the worker.
 
@@ -1259,5 +1272,6 @@ class DynamicMultiprocessingRunner(BaseRunner):
             monitor._mark_as_done()
             self._callback.on_done(monitor)
             controller.assert_all_workers_joined()
+            msg_queue.close()
 
         self._logger.info("Runner complete.")
