@@ -213,6 +213,7 @@ class BaseDatasetWriter(ABC):
         if isinstance(ds._ex_iterable, (ArrowExamplesIterable, RebatchedArrowExamplesIterable)):
             ds = ds.with_format(type=FormatType.ARROW.value)
 
+        all_formats = [item.value for item in FormatType]
         supported_formats = type(self).SUPPORTED_FORMATS
 
         # Get the fallback formatting in case the dataset formatting is not supported
@@ -220,7 +221,7 @@ class BaseDatasetWriter(ABC):
         # Get the dataset formatting
         formatting = ds._formatting
         formatting = formatting.format_type if formatting is not None else fallback_formatting
-        formatting = FormatType(formatting) if formatting in FormatType else fallback_formatting
+        formatting = FormatType(formatting) if formatting in all_formats else fallback_formatting
         # Check if the formatting is supported by the writer
         formatting = formatting if formatting in supported_formats else fallback_formatting
         write_fn = supported_formats[formatting]
