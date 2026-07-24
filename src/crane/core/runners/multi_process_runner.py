@@ -53,6 +53,22 @@ from .base import BaseRunner, WorkerProcessingStage, WorkerRole
 # shorthands and helper type aliases
 Stages: TypeAlias = WorkerProcessingStage
 
+# The lazy processing steps that `_prepare_dataset` separates from the data source.
+# `FormattedExamplesIterable` was introduced in newer `datasets` releases (it is inserted
+# into the iterable chain by `.map`); guard the import so crane keeps working on versions
+# where it does not exist yet.
+_SEPARABLE_EX_ITERABLES: tuple[type, ...] = (
+    MappedExamplesIterable,
+    FilteredExamplesIterable,
+    RebatchedArrowExamplesIterable,
+)
+try:
+    from datasets.iterable_dataset import FormattedExamplesIterable as _FormattedExamplesIterable
+
+    _SEPARABLE_EX_ITERABLES += (_FormattedExamplesIterable,)
+except ImportError:
+    pass
+
 
 @dataclass
 class WorkerContext:
@@ -951,24 +967,10 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         # TODO: rethink which ex_iterable items to include
         #       maybe just all of them, i.e. all those that have the ex_iterable attribute
-        if isinstance(
-            ex_iterable,
-            (
-                MappedExamplesIterable,
-                FilteredExamplesIterable,
-                RebatchedArrowExamplesIterable,
-            ),
-        ):
+        if isinstance(ex_iterable, _SEPARABLE_EX_ITERABLES):
             # collect all processing steps to separate off
             transform = ExamplesIterablePipeline([ex_iterable])
-            while isinstance(
-                transform.src_iterable,
-                (
-                    MappedExamplesIterable,
-                    FilteredExamplesIterable,
-                    RebatchedArrowExamplesIterable,
-                ),
-            ):
+            while isinstance(transform.src_iterable, _SEPARABLE_EX_ITERABLES):
                 transform.insert(0, transform.src_iterable)
 
             self._logger.info(
