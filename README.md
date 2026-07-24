@@ -94,6 +94,56 @@ ds = datasets.load_from_disk("data")
 ```
 
 
+## How Multiprocessing Works
+
+HuggingFace iterable datasets expose a fixed number of *shards* (`ds.n_shards`). The naive way to parallelize is to hand one shard to each worker, but that caps parallelism at the number of shards, leaves extra cores idle, and stalls whenever shards are uneven in size. `crane` avoids this with a **dynamic runner** that assigns work in two stages depending on how many workers there are relative to shards.
+
+### Stage 1 — one worker per shard
+
+While shards remain unassigned, every idle worker claims a whole shard and processes it end-to-end (read → transform → write) on its own. There is no cross-worker communication, so overhead is minimal. When `num_workers ≤ num_shards`, this alone keeps every worker busy.
+
+### Stage 2 — multiple workers per shard
+
+Once all shards are assigned but workers are still free, either because `num_workers > num_shards`, or because some workers finished their shard while others are still busy, idle workers join an already in-progress shard instead of sitting idle. The workers on that shard split into two roles connected by a shared queue:
+
+- **Producers** read raw batches from the shard and push them onto the queue.
+- **Consumers** pull batches off the queue and run the transform and write steps.
+
+```mermaid
+flowchart LR
+    s0[("Data Shard 1")] --> p0["👷 Producer"]
+    s1[("Data Shard 2")] --> p1["👷 Producer"]
+    s2[("Data Shard 3")] --> p2["👷 Producer"]
+
+    p0 --> q
+    p1 --> q
+    p2 --> q
+
+    q(["📦 Queue"])
+
+    q --> c0["⚙️ Consumer"] --> o0[("Out Shard 1")]
+    q --> c1["⚙️ Consumer"] --> o1[("Out Shard 1")]
+
+    classDef store fill:#eef6ff,stroke:#4a90d9,color:#1a3d5c;
+    classDef prod fill:#e9f9ee,stroke:#3fae63,color:#1c5230;
+    classDef cons fill:#fff4e6,stroke:#e08e0b,color:#7a4a00;
+    classDef queue fill:#f3ecff,stroke:#8a5cd1,color:#3d1f6b;
+
+    class s0,s1,s2,o0,o1 store;
+    class p0,p1,p2 prod;
+    class c0,c1 cons;
+    class q queue;
+```
+
+This lets more than one worker collaborate on a single shard, so a shard can be drained by as much compute as is available. All producers feed the **same** central queue, and any consumer can pull the next batch from it — decoupling how fast data is read from how fast it is transformed and written.
+
+Crucially, the split between producers and consumers is **not fixed**. `crane` aims to dynamically shift workers between the two roles according to queue utilization to maximize throughput:
+
+- If the queue is **full**, producers are running ahead and end up stalling — the bottleneck is downstream, so a worker is better spent as a consumer.
+- If the queue is **empty**, consumers are starved and sit idle — the bottleneck is upstream, so a worker is better spent as a producer.
+
+A **balancer** continuously watches the queue's fill level and the time producers and consumers spend blocked, and shifts workers between the two roles to keep the two sides matched — searching for the sweet spot where neither side is left waiting and total throughput is maximized.
+
 ## Contributions
 
 Contributions are welcome! Feel free to submit a pull request or open an issue to discuss your ideas.

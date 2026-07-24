@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import threading
+import warnings
 from enum import Enum
 from typing import Iterable, TypeAlias, TypedDict
 
@@ -367,6 +368,18 @@ class ProgressMonitor(object):
                 # compute queue size and update the moving average
                 qsize = self._queue.qsize() * self._item_size
                 self._ema_queue_size.update(clock(), qsize)
+
+        except NotImplementedError:  # pragma: not covered
+            # Queue.qsize() relies on sem_getvalue(), which is not implemented on
+            # some platforms (notably macOS). Queue-size monitoring is unavailable
+            # there, so warn once and stop the monitor thread instead of spinning.
+            warnings.warn(
+                "Queue size monitoring is not supported on this platform "
+                "(multiprocessing.Queue.qsize() is unavailable); disabling it.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
 
         except (BrokenPipeError, ConnectionResetError):  # pragma: not covered
             # queue connection closed
