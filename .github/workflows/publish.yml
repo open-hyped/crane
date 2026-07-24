@@ -10,10 +10,18 @@ jobs:
     name: Build distribution 📦
     runs-on: ubuntu-latest
 
+    outputs:
+      is_local: ${{ steps.check_version.outputs.is_local }}
+
     steps:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+        # setuptools_scm derives the version from git tags; a shallow clone
+        # without tags makes it fall back to a local dev version (e.g.
+        # "0.1.dev1+g<hash>") that PyPI rejects. Fetch full history and tags.
+        fetch-depth: 0
+        fetch-tags: true
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -26,6 +34,20 @@ jobs:
         --user
     - name: Build a binary wheel and a source tarball
       run: python3 -m build
+    - name: Check for local version
+      id: check_version
+      # A PEP 440 local version identifier is the part after "+" in the version.
+      # PyPI refuses uploads containing one, so detect it here and expose the
+      # result to gate the publish job below.
+      run: |
+        version=$(python3 -c "import glob, os; print(os.path.basename(glob.glob('dist/*.whl')[0]).split('-')[1])")
+        echo "Built version: $version"
+        if [[ "$version" == *"+"* ]]; then
+          echo "is_local=true" >> "$GITHUB_OUTPUT"
+          echo "::warning::Built version '$version' contains a local segment; skipping PyPI upload."
+        else
+          echo "is_local=false" >> "$GITHUB_OUTPUT"
+        fi
     - name: Store the distribution packages
       uses: actions/upload-artifact@v4
       with:
@@ -36,6 +58,8 @@ jobs:
     name: Publish Python 🐍 distribution 📦 to PyPI
     needs:
     - build
+    # never attempt to upload a local version — PyPI rejects it with a 400
+    if: needs.build.outputs.is_local == 'false'
     runs-on: ubuntu-latest
 
     environment:

@@ -2,6 +2,7 @@ import json
 import multiprocessing as mp
 from unittest.mock import MagicMock, call, patch
 
+import datasets
 import pytest
 from datasets import Dataset
 
@@ -245,6 +246,10 @@ def _double_fn(x):
     return {"obj": x["obj"] * 2}
 
 
+def _plus_one_fn(x):
+    return {"obj": x["obj"] + 1}
+
+
 class TestDynamicMultiprocessingRunner:
     @pytest.fixture
     def ds(self):
@@ -276,6 +281,26 @@ class TestDynamicMultiprocessingRunner:
         fn = SharedMock()
         runner.run(ds, fn)
         # make sure all samples have been processed
+        fn.assert_has_calls([call(sample) for sample in ds], same_order=False)
+
+    @pytest.mark.parametrize("num_shards", [2, 3])
+    @pytest.mark.parametrize("with_features", [False, True])
+    def test_run_with_map(self, num_shards, with_features, runner):
+        # a lazy `.map` inserts a `FormattedExamplesIterable` into the chain (newer
+        # `datasets`); the worker must still be able to drive the separated source
+        # through the arrow path when it is wrapped in a StoppableExamplesIterable.
+        samples = {"obj": [i for i in range(20)]}
+        ds = Dataset.from_dict(samples)
+        ds = ds.to_iterable_dataset(num_shards)
+        if with_features:
+            features = datasets.Features({"obj": datasets.Value("int64")})
+            ds = ds.map(_plus_one_fn, features=features)
+        else:
+            ds = ds.map(_plus_one_fn)
+
+        fn = SharedMock()
+        runner.run(ds, fn)
+        # make sure the mapped samples have been processed
         fn.assert_has_calls([call(sample) for sample in ds], same_order=False)
 
     def test_run_with_keyboard_interrupt(self, runner, ds):
