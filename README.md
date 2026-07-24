@@ -94,6 +94,23 @@ ds = datasets.load_from_disk("data")
 ```
 
 
+## How Multiprocessing Works
+
+HuggingFace iterable datasets expose a fixed number of *shards* (`ds.n_shards`). The naive way to parallelize is to hand one shard to each worker, but that caps parallelism at the number of shards, leaves extra cores idle, and stalls whenever shards are uneven in size. `crane` avoids this with a **dynamic runner** that assigns work in two stages depending on how many workers there are relative to shards.
+
+### Stage 1 — one worker per shard
+
+While shards remain unassigned, every idle worker claims a whole shard and processes it end-to-end (read → transform → write) on its own. There is no cross-worker communication, so overhead is minimal. When `num_workers ≤ num_shards`, this alone keeps every worker busy.
+
+### Stage 2 — multiple workers per shard
+
+Once all shards are assigned but workers are still free, either because `num_workers > num_shards`, or because some workers finished their shard while others are still busy, idle workers join an already in-progress shard instead of sitting idle. The workers on that shard split into two roles connected by a shared queue:
+
+- **Producers** read raw batches from the shard and push them onto the queue.
+- **Consumers** pull batches off the queue and run the transform and write steps.
+
+This lets more than one worker collaborate on a single shard, so a shard can be drained by as much compute as is available. A **balancer** continuously watches the queue's fill level and the time producers and consumers spend blocked, and adds or removes producers to keep the two sides matched, so the queue is neither starved (consumers waiting) nor saturated (producers waiting).
+
 ## Contributions
 
 Contributions are welcome! Feel free to submit a pull request or open an issue to discuss your ideas.
