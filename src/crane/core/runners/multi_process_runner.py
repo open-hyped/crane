@@ -335,14 +335,13 @@ class Worker(mp.Process):
             WorkerContext | None: The deserialized worker context if available,
             otherwise `None`.
         """
-        if self._ctx_queue.qsize() > 0:
-            try:
-                ctx_bytes = self._ctx_queue.get(block=blocking, timeout=timeout)
-                ctx = dill.loads(ctx_bytes)
-                self._logger.debug(f"Received {ctx}.")
-                return ctx
-            except Empty:
-                pass
+        try:
+            ctx_bytes = self._ctx_queue.get(block=blocking, timeout=timeout)
+            ctx = dill.loads(ctx_bytes)
+            self._logger.debug(f"Received {ctx}.")
+            return ctx
+        except Empty:
+            pass
 
         self._logger.debug("No worker context received.")  # TODO
         return None
