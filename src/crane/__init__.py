@@ -19,6 +19,7 @@ __all__ = [
     "TqdmReporterCallback",
     "JsonDatasetWriter",
     "ArrowDatasetWriter",
+    "ParquetDatasetWriter",
     "setup_logging",
 ]
 
@@ -29,6 +30,7 @@ from .core import Callback, DatasetConsumer, ShardingStrategy, TqdmReporterCallb
 if TYPE_CHECKING:  # pragma: not covered
     from .arrow import ArrowDatasetWriter
     from .json import JsonDatasetWriter
+    from .parquet import ParquetDatasetWriter
 
 else:
     import importlib
@@ -39,6 +41,7 @@ else:
         module = {
             "JsonDatasetWriter": ".json",
             "ArrowDatasetWriter": ".arrow",
+            "ParquetDatasetWriter": ".parquet",
         }[name]
         module = importlib.import_module(module, package=__name__)
         return getattr(module, name)
