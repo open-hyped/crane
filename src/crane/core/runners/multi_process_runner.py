@@ -66,10 +66,10 @@ _CTX_SEND_RETRY_INTERVAL: float = 0.01
 # be produced the queue only ever drains, so a short block is enough to ride out a queue
 # that happens to be full at that instant - and it is bounded, because the controller
 # gives up after the first failure and retries on its next message instead.
-_SENTINEL_PUT_TIMEOUT: float = 0.5
-
-# How long a consumer waits on a drained queue before giving up on its own. With the
-# end-of-stream sentinel this is only a backstop, never the normal path out.
+# How long a consumer keeps waiting on a queue that is delivering nothing at all. Only a
+# backstop against a lost close signal - a consumer normally leaves the moment the stream
+# is marked closed - so reaching it means something went wrong rather than that the run
+# ended.
 _QUEUE_GET_TIMEOUT: float = 30.0
 
 # The lazy processing steps that `_prepare_dataset` separates from the data source.
@@ -991,6 +991,7 @@ class WorkerController(object):
         num_shards: int,
         queue: None | _CountedQueue = None,
         queue_it: None | QueueExamplesIterable = None,
+        stream_closed: Any = None,
     ) -> None:
         """Initializes the WorkerController with the provided workers and serializer.
 
@@ -1001,6 +1002,9 @@ class WorkerController(object):
             queue (None | _CountedQueue): The shared data queue, created before the
                 workers so they inherit it through `fork`. Defaults to a fresh one, which
                 is only useful when there are no real workers to share it with.
+            queue_it (None | QueueExamplesIterable): The consumers' view of that queue.
+            stream_closed (Any): The event marking the queue as finished. Defaults to a
+                fresh one.
         """
         self.prefetch = prefetch
         self.workers = workers
@@ -1012,15 +1016,11 @@ class WorkerController(object):
                 self.queue, sentinel=None, timeout=_QUEUE_GET_TIMEOUT, num_shards=num_shards
             )
         )
+        self.stream_closed = stream_closed if stream_closed is not None else mp.Event()
         self.standalone_ranks = set()
         self.producer_ranks = set()
         self.consumer_ranks = set()
         self.joined_ranks = set()
-        # Consumers already handed an end-of-stream sentinel. Sentinels are not addressed
-        # to a rank - any consumer takes any of them - so this is really a count of how
-        # many are still owed, kept per rank so that `free_worker` can clear it when a
-        # worker leaves the role and may later re-enter it.
-        self.sentinel_sent_ranks = set()
         self._logger = logging.getLogger(f"{type(self).__module__}.{type(self).__qualname__}")
 
     @property
@@ -1170,55 +1170,26 @@ class WorkerController(object):
                 return rank
             self._logger.info(f"Worker {rank} did not accept processor context.")
 
-    def signal_no_more_data(self) -> int:
-        """Post the queue's end-of-stream sentinel, one for each consumer.
+    def close_stream(self) -> None:
+        """Mark the shared queue as finished, releasing every consumer waiting on it.
 
-        `QueueExamplesIterable` leaves a drained queue either on the sentinel or, failing
-        that, once its `get` times out after 30 s - and nothing anywhere ever posted the
-        sentinel, so waiting out the timeout in full was a consumer's only way to finish.
-        That is the ordinary end of every run rather than an edge case: once the shard
-        pool empties, every worker still alive is made a consumer, so a run paid 30 s per
-        consumer round *after* its real work was already done. Measured on a 4-worker
-        run whose 8 shards were finished at t=18 s, the run did not end until t=76 s.
+        `QueueExamplesIterable` leaves a drained queue either on this flag or, failing
+        that, once its `get` has come up empty for the whole timeout. Nothing used to set
+        anything, so waiting out 30 s was a consumer's only way to finish - and that is
+        the ordinary end of every run, since once the shard pool empties every worker
+        still alive is made a consumer.
 
-        Only safe once no further data can appear - the caller establishes that; see
-        `_release_finished_consumers`.
+        A flag rather than a sentinel per consumer, because a sentinel is not addressed:
+        any consumer takes any of them, so releasing exactly the set of workers that are
+        waiting means counting recipients correctly through role changes, and retrying
+        posts that a full queue rejected - at a moment when no messages may be arriving to
+        prompt a retry. Setting a flag every consumer can see needs none of that.
 
-        A sentinel that cannot be posted must not simply be forgotten. The queue holds one
-        item per worker, so at the moment the end is detected it may still be full of real
-        data; dropping the attempt then leaves those consumers to discover the end by
-        timing out, which is exactly the 30 s stall this exists to prevent. It showed up in
-        benchmarks as a rare but severe collapse - most runs at 5185 documents/s, an
-        occasional one at 319, the difference being a multiple of 30 s. So each consumer is
-        tracked until it has actually been given one, a short block absorbs a queue that is
-        merely busy, and whatever is still owed is retried on the controller's next message.
-
-        Returns:
-            int: The number of sentinels posted by this call.
+        Only safe once no further data can appear; see `_close_stream_if_finished`.
         """
-        posted = 0
-        for rank in tuple(self.consumer_ranks):
-            if rank in self.sentinel_sent_ranks:
-                continue
-            try:
-                self.queue.put(self.queue_it.sentinel, timeout=_SENTINEL_PUT_TIMEOUT)
-            except Full:
-                # Still busy. Leave the rest owed rather than blocking the controller
-                # any longer; the next message retries.
-                self._logger.debug("Data queue full while posting sentinels; will retry.")
-                break
-            self.sentinel_sent_ranks.add(rank)
-            posted += 1
-
-        if posted > 0:
-            self._logger.debug(f"Posted {posted} end-of-stream sentinels to the data queue.")
-
-        return posted
-
-    @property
-    def consumers_awaiting_sentinel(self) -> set[int]:
-        """Consumers that are owed an end-of-stream sentinel and have not had one."""
-        return self.consumer_ranks - self.sentinel_sent_ranks
+        if not self.stream_closed.is_set():
+            self.stream_closed.set()
+            self._logger.debug("Marked the data queue as closed.")
 
     def free_worker(self, rank: int) -> None:
         """Removes the worker from any active roles.
@@ -1229,8 +1200,6 @@ class WorkerController(object):
         self.standalone_ranks -= {rank}
         self.producer_ranks -= {rank}
         self.consumer_ranks -= {rank}
-        # If it becomes a consumer again it needs a sentinel of its own.
-        self.sentinel_sent_ranks -= {rank}
 
     def stop_worker(self, rank: int) -> None:
         """Sends a stop signal to a worker, indicating that it should cease operation.
@@ -1504,31 +1473,19 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 or controller.standalone_ranks
             )
 
-        def _release_finished_consumers() -> None:
-            """Tell the consumers the data has run out, when it actually has.
+        def _close_stream_if_finished() -> None:
+            """Mark the queue closed once the data really has run out.
 
             A consumer blocked on the shared queue cannot distinguish "empty for now"
             from "empty for good" - that is what the sentinel is for.
 
             Note that this says nothing about what is already *buffered*. Data that has
             been produced still has to be worked through, and spare workers joining as
-            consumers is what drains it in parallel, so the run is not settled here.
+            consumers is what drains it in parallel, so the run is not settled here - the
+            flag only says that nothing further will arrive.
             """
-            if not _no_more_data():
-                return
-
-            controller.signal_no_more_data()
-
-        def _retry_owed_sentinels() -> None:
-            """Deliver any sentinel a full queue prevented from going out earlier.
-
-            Cheap to call on every message, and it has to be: once every worker is a
-            consumer blocked on a drained queue, no further message will arrive to
-            prompt a retry, so the retries have to happen while messages are still
-            flowing.
-            """
-            if controller.consumers_awaiting_sentinel:
-                _release_finished_consumers()
+            if _no_more_data():
+                controller.close_stream()
 
         done = False
         while not done:
@@ -1539,8 +1496,6 @@ class DynamicMultiprocessingRunner(BaseRunner):
             rank: int = msg["rank"]
             msg_type = MessageType(msg["type"])
             payload = msg["payload"]
-
-            _retry_owed_sentinels()
 
             # handle message
             if msg_type is MessageType.READY:
@@ -1586,7 +1541,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     # run the callback
                     self._callback.on_shard_completed(monitor, shard_id)
 
-                _release_finished_consumers()
+                _close_stream_if_finished()
 
             elif msg_type is MessageType.CTX_CANCELED:
                 if monitor.get_worker_role(rank) is WorkerRole.PRODUCER:
@@ -1604,7 +1559,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     # run the callback
                     self._callback.on_shard_canceled(monitor, shard_id)
 
-                _release_finished_consumers()
+                _close_stream_if_finished()
 
             elif msg_type is MessageType.CTX_SWITCH:
                 # parse payload
@@ -1678,7 +1633,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     # The queue check is the important half: while data is still buffered
                     # the extra consumers are what drain it in parallel, which is the
                     # whole point of stage 2.
-                    _release_finished_consumers()
+                    _close_stream_if_finished()
                     controller.stop_worker(rank)
 
                 else:
@@ -1700,7 +1655,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     # A worker joining as a consumer just as the data runs out needs its
                     # own sentinel, or it would sit out the full timeout on a queue that
                     # will never fill again.
-                    _release_finished_consumers()
+                    _close_stream_if_finished()
 
                     # evenutally all workers are consumers
                     if monitor.alive_workers == controller.consumer_ranks:
@@ -1742,8 +1697,13 @@ class DynamicMultiprocessingRunner(BaseRunner):
         # object for every worker, which used to cost a serialisation per worker and a
         # deserialisation on each worker's critical path before its first shard.
         data_queue = _CountedQueue(maxsize=self._num_workers)
+        stream_closed = mp.Event()
         queue_it = QueueExamplesIterable(
-            data_queue, sentinel=None, timeout=_QUEUE_GET_TIMEOUT, num_shards=num_shards
+            data_queue,
+            sentinel=None,
+            timeout=_QUEUE_GET_TIMEOUT,
+            num_shards=num_shards,
+            closed=stream_closed,
         )
         finalizer_formatting = (
             None if formatting is None else FormattingConfig(format_type=formatting)
@@ -1787,7 +1747,12 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         # create controller
         controller = WorkerController(
-            workers, self._prefetch, num_shards, queue=data_queue, queue_it=queue_it
+            workers,
+            self._prefetch,
+            num_shards,
+            queue=data_queue,
+            queue_it=queue_it,
+            stream_closed=stream_closed,
         )
         controller.start()
 

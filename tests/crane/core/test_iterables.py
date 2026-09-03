@@ -1,3 +1,4 @@
+import time
 from itertools import islice
 from queue import Queue
 from time import sleep
@@ -164,3 +165,46 @@ class TestFastRebatchedArrowExamplesIterable:
         else:
             assert len(pa_tables) == 3
             assert pa_tables[2].num_rows == 4
+
+
+class TestQueueExamplesIterableShutdown:
+    """How a consumer learns the queue is finished."""
+
+    def test_stops_promptly_once_closed(self):
+        import threading
+        from queue import Queue as SyncQueue
+
+        closed = threading.Event()
+        # A 30s timeout that must not be paid: the flag is what ends the iteration.
+        iterable = QueueExamplesIterable(
+            SyncQueue(), sentinel=None, timeout=30.0, closed=closed, poll_interval=0.01
+        )
+        closed.set()
+
+        start = time.perf_counter()
+        assert list(iterable._iter_arrow()) == []
+        assert time.perf_counter() - start < 5
+
+    def test_keeps_waiting_while_the_stream_is_open(self):
+        import threading
+        from queue import Queue as SyncQueue
+
+        closed = threading.Event()
+        queue = SyncQueue()
+        iterable = QueueExamplesIterable(
+            queue, sentinel=None, timeout=30.0, closed=closed, poll_interval=0.01
+        )
+
+        def close_later():
+            time.sleep(0.3)
+            closed.set()
+
+        thread = threading.Thread(target=close_later)
+        thread.start()
+        start = time.perf_counter()
+        assert list(iterable._iter_arrow()) == []
+        elapsed = time.perf_counter() - start
+        thread.join()
+
+        # It waited for the flag rather than leaving the moment the queue looked empty.
+        assert 0.25 < elapsed < 5

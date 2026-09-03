@@ -514,32 +514,31 @@ class TestWorkerContextReuse:
 class TestConsumerShutdown:
     """Consumers are told the data ran out instead of inferring it from a timeout."""
 
-    def test_signal_no_more_data_posts_one_sentinel_per_consumer(self):
-        controller = WorkerController(
-            workers=[MagicMock(), MagicMock(), MagicMock()],
-            prefetch=8,
-            num_shards=2,
-            queue=Queue(maxsize=3),
-        )
-        controller.consumer_ranks = {0, 1}
-
-        assert controller.signal_no_more_data() == 2
-        assert controller.queue.get_nowait() is controller.queue_it.sentinel
-        assert controller.queue.get_nowait() is controller.queue_it.sentinel
-        assert controller.queue.empty()
-
-    def test_signal_no_more_data_is_a_no_op_without_consumers(self):
+    def test_close_stream_sets_the_shared_flag(self):
         controller = WorkerController(
             workers=[MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=1)
         )
+        assert not controller.stream_closed.is_set()
 
-        assert controller.signal_no_more_data() == 0
-        assert controller.queue.empty()
+        controller.close_stream()
+
+        assert controller.stream_closed.is_set()
+
+    def test_close_stream_is_idempotent(self):
+        # It is called from several points in the message loop, whenever the condition
+        # happens to hold, so calling it repeatedly must be free of consequence.
+        controller = WorkerController(
+            workers=[MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=1)
+        )
+        controller.close_stream()
+        controller.close_stream()
+
+        assert controller.stream_closed.is_set()
 
     def test_run_does_not_wait_out_the_queue_timeout(self):
-        # `QueueExamplesIterable` gives up on a drained queue after 30 s, and nothing
-        # used to post the sentinel that would end it sooner - so every run paid that
-        # timeout, once per consumer round, after all its real work was done.
+        # `QueueExamplesIterable` gives up on a queue delivering nothing after 30 s, and
+        # nothing used to mark the stream closed sooner - so every run paid that timeout
+        # after all its real work was done.
         runner = DynamicMultiprocessingRunner(
             num_workers=2,
             prefetch_factor=8,
@@ -557,195 +556,6 @@ class TestConsumerShutdown:
 
         fn.assert_has_calls([call(sample) for sample in ds], same_order=False)
         assert elapsed < 20, f"run took {elapsed:.1f}s, suggesting it sat out the queue timeout"
-
-
-def _a_finalizer(batch):
-    return None
-
-
-def _another_finalizer(batch):
-    return None
-
-
-class TestFinalizerReuse:
-    """The finalizer is re-sent only when it, or how it is called, actually changes."""
-
-    @pytest.fixture
-    def worker(self):
-        queue = mp.Queue()
-        worker = Worker(
-            rank=0,
-            num_workers=1,
-            msg_queue=queue,
-            progress_report_interval=0.0,
-            worker_init=MagicMock(),
-            worker_finalize=MagicMock(),
-        )
-        yield worker
-        queue.close()
-
-    def test_omits_a_finalizer_the_worker_already_has(self, worker):
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-
-        assert sent[0].data_finalizer is not None
-        assert sent[1].data_finalizer is None
-
-    def test_resends_when_the_finalizer_changes(self, worker):
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-            worker.send_ctx(
-                _standalone_ctx(finalizer=_another_finalizer, batch_size=8), blocking=False
-            )
-
-        assert sent[1].data_finalizer is not None
-
-    def test_resends_when_only_the_batch_size_changes(self, worker):
-        # `apply_ctx` applies the batch size and formatting only alongside a non-None
-        # finalizer, so dropping the finalizer would silently drop these with it - which
-        # is exactly what separates a producer's context from a standalone's.
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=64), blocking=False)
-
-        assert sent[1].data_finalizer is not None
-        assert sent[1].data_finalizer_batch_size == 64
-
-
-class TestContextPartCache:
-    """One transform is pickled once for the whole run, not once per worker."""
-
-    def test_reuses_the_same_buffer_for_the_same_object(self):
-        cache = _ContextPartCache()
-        first = cache.dumps(_a_transform)
-        second = cache.dumps(_a_transform)
-
-        assert first.payload is second.payload
-        assert second.unwrap() is _a_transform
-
-    def test_serialises_distinct_objects_separately(self):
-        cache = _ContextPartCache()
-
-        assert cache.dumps(_a_transform).payload != cache.dumps(_another_transform).payload
-
-    def test_stops_growing_once_full(self):
-        # Role switches build a fresh bound method every time, so entries must not
-        # accumulate for the length of a run.
-        cache = _ContextPartCache(max_entries=2)
-        held = [lambda: None for _ in range(5)]
-        for fn in held:
-            cache.dumps(fn)
-
-        assert len(cache._entries) == 2
-
-    def test_workers_sharing_a_cache_pickle_a_transform_once(self):
-        cache = _ContextPartCache()
-        queue = mp.Queue()
-        workers = [
-            Worker(
-                rank=rank,
-                num_workers=2,
-                msg_queue=queue,
-                progress_report_interval=0.0,
-                worker_init=MagicMock(),
-                worker_finalize=MagicMock(),
-                ctx_part_cache=cache,
-            )
-            for rank in range(2)
-        ]
-        try:
-            sent = []
-            for worker in workers:
-                with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-                    worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
-
-            # `_capture_sent` pickles what it captured, so buffer identity cannot
-            # survive it; that the cache holds one entry is what says it pickled once.
-            assert [type(ctx.data_transform) for ctx in sent] == [_PrePickled, _PrePickled]
-            assert sent[0].data_transform.payload == sent[1].data_transform.payload
-            assert len(cache._entries) == 1
-        finally:
-            queue.close()
-
-    def test_a_received_context_carries_the_real_callables(self):
-        # Whatever the wire format, what the worker applies has to be the originals.
-        cache = _ContextPartCache()
-        queue = mp.Queue()
-        worker = Worker(
-            rank=0,
-            num_workers=1,
-            msg_queue=queue,
-            progress_report_interval=0.0,
-            worker_init=MagicMock(),
-            worker_finalize=MagicMock(),
-            ctx_part_cache=cache,
-        )
-        try:
-            worker.send_ctx(
-                _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8),
-                blocking=False,
-            )
-            received = worker._recv_ctx(blocking=True, timeout=5.0)
-        finally:
-            queue.close()
-
-        assert received.data_transform is _a_transform
-        assert received.data_finalizer is _a_finalizer
-        assert received.data_finalizer_batch_size == 8
-
-
-class TestSentinelDelivery:
-    """A sentinel that could not be posted is owed, not forgotten."""
-
-    def test_a_full_queue_leaves_the_sentinel_owed(self):
-        # The queue holds one item per worker, so at the moment the end is detected it
-        # can still be full of real data. Dropping the attempt there left consumers to
-        # discover the end by timing out - the 30 s stall this whole mechanism exists to
-        # remove, reappearing as a rare but severe collapse.
-        controller = WorkerController(
-            workers=[MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=1)
-        )
-        controller.consumer_ranks = {0}
-        controller.queue.put_nowait("data")  # maxsize is one worker, so now full
-
-        assert controller.signal_no_more_data() == 0
-        assert controller.consumers_awaiting_sentinel == {0}
-
-        controller.queue.get_nowait()  # the consumer drains it
-
-        assert controller.signal_no_more_data() == 1
-        assert controller.consumers_awaiting_sentinel == set()
-        assert controller.queue.get_nowait() is controller.queue_it.sentinel
-
-    def test_a_consumer_is_not_sent_two_sentinels(self):
-        controller = WorkerController(
-            workers=[MagicMock(), MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=2)
-        )
-        controller.consumer_ranks = {0}
-
-        assert controller.signal_no_more_data() == 1
-        assert controller.signal_no_more_data() == 0
-        assert controller.queue.qsize() == 1
-
-    def test_a_worker_re_entering_the_role_is_owed_another(self):
-        # Freeing a worker and giving it the consumer role again is a fresh consumer
-        # blocked on the queue, so the earlier sentinel does not cover it.
-        controller = WorkerController(
-            workers=[MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=1)
-        )
-        controller.consumer_ranks = {0}
-        controller.signal_no_more_data()
-        controller.queue.get_nowait()
-
-        controller.free_worker(0)
-        controller.consumer_ranks = {0}
-
-        assert controller.consumers_awaiting_sentinel == {0}
-        assert controller.signal_no_more_data() == 1
 
 
 class TestCountedQueue:

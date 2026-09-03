@@ -1,6 +1,7 @@
 """Custon ExampleIterable Implementations to control and monitor data flow."""
 from __future__ import annotations
 
+import warnings
 from copy import copy
 from functools import partial
 from queue import Empty, Queue
@@ -283,6 +284,8 @@ class QueueExamplesIterable(BaseExamplesIterable):
         sentinel: Any = None,
         timeout: None | float = None,
         num_shards: None | int = None,
+        closed: Any = None,
+        poll_interval: float = 0.05,
     ) -> None:
         """Initialize the :class:`QueueExamplesIterable`.
 
@@ -290,16 +293,25 @@ class QueueExamplesIterable(BaseExamplesIterable):
             queue (Queue): The queue to retrieve data from.
             sentinel (None | Any): The sentinel value to signal the end of the queue.
                 Defaults to :code:`None`.
-            timeout (None | float): Timeout for queue `get` operations, in seconds.
-                If None, the :code:`get` operation will block indefinitely. Defaults to
-                :code:`None`.
+            timeout (None | float): How long to keep waiting on a queue that is delivering
+                nothing at all. Only a backstop against a lost `closed` signal - an idle
+                consumer normally leaves as soon as `closed` is set. If None, waits
+                forever. Defaults to :code:`None`.
             num_shards (None | int): The number of shards. Defaults to :code:`None`.
+            closed (Any): An event set once nothing further will be put on the queue. A
+                consumer stops as soon as it is set and the queue is drained. Waiting on
+                a flag rather than counting sentinels means termination does not depend on
+                delivering exactly one message to each of an unknown set of consumers.
+            poll_interval (float): How long a single `get` waits before re-checking
+                `closed`. This is what a missed wake-up costs, so keep it small.
         """
         super().__init__(None)
         self.queue = queue
         self.sentinel = sentinel
         self.timeout = timeout
         self.n_shards = num_shards
+        self.closed = closed
+        self.poll_interval = poll_interval
 
     def __iter__(self) -> Iterable[tuple[Key, dict[str, Any]]]:
         """Iterate over the examples retrieved from the queue.
@@ -324,19 +336,44 @@ class QueueExamplesIterable(BaseExamplesIterable):
     def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
         """Iterate over the Arrow tables retrieved from the queue.
 
+        Waits in short slices rather than one long block, so that an idle consumer
+        notices `closed` promptly instead of sitting out the whole timeout. That is the
+        difference between a run ending when the work is done and a run ending a fixed
+        30 seconds later.
+
         Yields:
             tuple[Key, pa.Table]: A tuple containing the key and the Arrow table.
         """
+        idle_since = clock()
         while True:
             try:
-                getter = partial(self.queue.get, timeout=self.timeout)
-                for pa_table in iter(getter, self.sentinel):
-                    metadata = pa_table.schema.metadata
-                    key = metadata.pop(b"_key").decode()
-                    yield key, pa_table.replace_schema_metadata(metadata=metadata)
-                break
+                item = self.queue.get(timeout=self.poll_interval)
             except Empty:
+                # Nothing waiting. Leave if the producers are finished, and otherwise
+                # keep waiting - data may still be on its way.
+                if self.closed is not None and self.closed.is_set():
+                    break
+                if self.timeout is not None and (clock() - idle_since) >= self.timeout:
+                    if self.closed is not None:
+                        # A close signal was expected and never came. That is a bug, not
+                        # an ending - without `closed` the timeout is simply how this
+                        # iterable is meant to stop, so say nothing in that case.
+                        warnings.warn(
+                            f"Queue delivered nothing for {self.timeout}s and was never "
+                            "marked closed; giving up on it.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    break
+                continue
+
+            if item is self.sentinel or item == self.sentinel:
                 break
+
+            idle_since = clock()
+            metadata = item.schema.metadata
+            key = metadata.pop(b"_key").decode()
+            yield key, item.replace_schema_metadata(metadata=metadata)
 
     @property
     def num_shards(self) -> int:
