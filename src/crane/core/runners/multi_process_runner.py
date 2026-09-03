@@ -62,10 +62,6 @@ Stages: TypeAlias = WorkerProcessingStage
 _CTX_SEND_TIMEOUT: float = 1.0
 _CTX_SEND_RETRY_INTERVAL: float = 0.01
 
-# How long to wait for room when posting an end-of-stream sentinel. Once no more data can
-# be produced the queue only ever drains, so a short block is enough to ride out a queue
-# that happens to be full at that instant - and it is bounded, because the controller
-# gives up after the first failure and retries on its next message instead.
 # How long a consumer keeps waiting on a queue that is delivering nothing at all. Only a
 # backstop against a lost close signal - a consumer normally leaves the moment the stream
 # is marked closed - so reaching it means something went wrong rather than that the run
@@ -616,7 +612,11 @@ class Worker(mp.Process):
                 changes["data_finalizer"] = None
             elif base is not None and self._matches(
                 candidate,
-                (base.data_finalizer, base.data_finalizer_batch_size, base.data_finalizer_formatting),
+                (
+                    base.data_finalizer,
+                    base.data_finalizer_batch_size,
+                    base.data_finalizer_formatting,
+                ),
             ):
                 changes["data_finalizer"] = INHERITED_FINALIZER
                 finalizer = candidate
@@ -1518,7 +1518,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
             """Mark the queue closed once the data really has run out.
 
             A consumer blocked on the shared queue cannot distinguish "empty for now"
-            from "empty for good" - that is what the sentinel is for.
+            from "empty for good" - that is what the flag is for.
 
             Note that this says nothing about what is already *buffered*. Data that has
             been produced still has to be worked through, and spare workers joining as
@@ -1670,10 +1670,10 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
                 elif _no_more_data() and controller.queue.empty():
                     # Nothing can be produced *and* nothing is left buffered, so a
-                    # consumer here could only wait for a sentinel and complete again.
-                    # The queue check is the important half: while data is still buffered
-                    # the extra consumers are what drain it in parallel, which is the
-                    # whole point of stage 2.
+                    # consumer here would find the stream already closed and complete
+                    # again immediately. The queue check is the important half: while data
+                    # is still buffered the extra consumers are what drain it in parallel,
+                    # which is the whole point of stage 2.
                     _close_stream_if_finished()
                     controller.stop_worker(rank)
 
@@ -1693,9 +1693,9 @@ class DynamicMultiprocessingRunner(BaseRunner):
                         finalizer_formatting=finalizer_formatting,
                     )
 
-                    # A worker joining as a consumer just as the data runs out needs its
-                    # own sentinel, or it would sit out the full timeout on a queue that
-                    # will never fill again.
+                    # A worker joining as a consumer just as the data runs out has to
+                    # find the stream marked closed, or it would sit out the full timeout
+                    # on a queue that will never fill again.
                     _close_stream_if_finished()
 
                     # evenutally all workers are consumers

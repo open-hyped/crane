@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import warnings
 from copy import copy
-from functools import partial
 from queue import Empty, Queue
 from typing import Any, Iterable
 
