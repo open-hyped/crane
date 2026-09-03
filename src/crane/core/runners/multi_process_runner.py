@@ -17,11 +17,12 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import multiprocessing.connection  # noqa: F401
+import time
 import traceback
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from queue import Empty
+from queue import Empty, Full
 from typing import Any, Callable, Iterable, TypeAlias
 
 import dill
@@ -33,6 +34,7 @@ from datasets.iterable_dataset import (
     FormattingConfig,
     MappedExamplesIterable,
     RebatchedArrowExamplesIterable,
+    SelectColumnsIterable,
     _BaseExamplesIterable,
     identity_func,
 )
@@ -53,6 +55,13 @@ from .base import BaseRunner, WorkerProcessingStage, WorkerRole
 # shorthands and helper type aliases
 Stages: TypeAlias = WorkerProcessingStage
 
+# How long to keep trying to hand a new context to a worker before giving up on that
+# particular context. The race this absorbs is the queue feeder thread being momentarily
+# behind, which resolves in milliseconds, so keep it short: contexts are also sent from
+# the balancer's hot path and a long block there would stall coordination.
+_CTX_SEND_TIMEOUT: float = 1.0
+_CTX_SEND_RETRY_INTERVAL: float = 0.01
+
 # The lazy processing steps that `_prepare_dataset` separates from the data source.
 # `FormattedExamplesIterable` was introduced in newer `datasets` releases (it is inserted
 # into the iterable chain by `.map`); guard the import so crane keeps working on versions
@@ -68,6 +77,42 @@ try:
     _SEPARABLE_EX_ITERABLES += (_FormattedExamplesIterable,)
 except ImportError:
     pass
+
+# Column projections are separable, but only conditionally. `.map(remove_columns=...)`
+# inserts a `SelectColumnsIterable` mid-chain, and if the walk stops there every step
+# below it stays with the data source: those steps then run in the producers, and
+# sharding a source that still contains an arrow-formatted map fails outright with
+# "doesn't implement iter_arrow()".
+#
+# Separating a projection unconditionally is not right either. One sitting directly on
+# the source is pure projection, and keeping it in the producer means fewer columns
+# travel through the queue. So a projection is separated only when there is something
+# separable beneath it, which is exactly the case where leaving it behind would strand
+# real work in the producers.
+_PROJECTION_EX_ITERABLES: tuple[type, ...] = (SelectColumnsIterable,)
+
+
+def _has_separable_below(ex_iterable: _BaseExamplesIterable) -> bool:
+    """Whether any step beneath `ex_iterable` is itself separable processing."""
+    node = getattr(ex_iterable, "ex_iterable", None)
+    while node is not None:
+        if isinstance(node, _SEPARABLE_EX_ITERABLES):
+            return True
+        node = getattr(node, "ex_iterable", None)
+    return False
+
+
+def _is_separable(ex_iterable: _BaseExamplesIterable) -> bool:
+    """Whether a step should be moved off the data source and into the workers.
+
+    Processing steps always are. A column projection is only worth separating when real
+    work sits beneath it; see `_PROJECTION_EX_ITERABLES`.
+    """
+    if isinstance(ex_iterable, _SEPARABLE_EX_ITERABLES):
+        return True
+    if isinstance(ex_iterable, _PROJECTION_EX_ITERABLES):
+        return _has_separable_below(ex_iterable)
+    return False
 
 
 @dataclass
@@ -269,15 +314,9 @@ class Worker(mp.Process):
         while self._recv_ctx_resp_conn.poll():
             self._recv_ctx_resp_conn.recv()
 
-        try:
-            # clear context queue
-            self._ctx_queue.get(timeout=0.1)
-        except Empty:
-            pass
-
         # serialize and send context
         ctx_bytes = dill.dumps(ctx)
-        self._ctx_queue.put_nowait(ctx_bytes)
+        self._send_ctx_bytes(ctx_bytes)
 
         if blocking:
             # wait for feedback from worker
@@ -291,6 +330,41 @@ class Worker(mp.Process):
         else:
             self._logger.debug(f"Sent new context to worker {self._rank} in non-blocking mode.")
             return True
+
+    def _send_ctx_bytes(self, ctx_bytes: bytes, timeout: float = _CTX_SEND_TIMEOUT) -> None:
+        """Replace whatever context is queued for the worker with `ctx_bytes`.
+
+        The queue holds at most one pending context, so a stale one is dropped first.
+        Draining and then calling `put_nowait` is not enough on its own: a
+        `multiprocessing.Queue` is fed by a background thread, so a successful `get()`
+        does not free the slot synchronously and an item already in flight can arrive
+        between the two calls. `put_nowait` then raises `Full`, which used to escape into
+        the controller's message loop and take it down - leaving the workers waiting for a
+        context that never came, so they never joined and the run hung.
+
+        Retry within a deadline instead, and treat exhaustion as a dropped context rather
+        than a fatal error: the balancer sends these continuously, so the next one will
+        carry the same information.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self._ctx_queue.get_nowait()
+            except Empty:
+                pass
+
+            try:
+                self._ctx_queue.put_nowait(ctx_bytes)
+                return
+            except Full:
+                if time.monotonic() >= deadline:
+                    self._logger.warning(
+                        f"Could not hand a new context to worker {self._rank} within "
+                        f"{timeout}s; the worker is not consuming its context queue. "
+                        f"Dropping this context."
+                    )
+                    return
+                time.sleep(_CTX_SEND_RETRY_INTERVAL)
 
     def _send_msg(self, msg_type: MessageType, payload: None | Any = None) -> None:
         """Send a message from the worker to the manager process.
@@ -966,10 +1040,10 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         # TODO: rethink which ex_iterable items to include
         #       maybe just all of them, i.e. all those that have the ex_iterable attribute
-        if isinstance(ex_iterable, _SEPARABLE_EX_ITERABLES):
+        if _is_separable(ex_iterable):
             # collect all processing steps to separate off
             transform = ExamplesIterablePipeline([ex_iterable])
-            while isinstance(transform.src_iterable, _SEPARABLE_EX_ITERABLES):
+            while _is_separable(transform.src_iterable):
                 transform.insert(0, transform.src_iterable)
 
             self._logger.info(
