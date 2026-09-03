@@ -8,6 +8,7 @@ through callbacks.
 """
 
 import logging
+import traceback
 from typing import Any, Callable, TypeAlias
 
 from datasets.iterable_dataset import FormattingConfig, IterableDataset
@@ -17,7 +18,14 @@ from ..iterables import FastRebatchedArrowExamplesIterable, TimedExamplesIterabl
 from ..monitor import ProgressMonitor, ProgressReport
 from ..utils import clock
 from ..worker import reset_worker_info, set_worker_info
-from .base import BaseRunner, WorkerProcessingStage, WorkerRole
+from .base import (
+    BaseRunner,
+    FailurePolicy,
+    ShardFailure,
+    ShardProcessingError,
+    WorkerProcessingStage,
+    WorkerRole,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,7 @@ class MainProcessRunner(BaseRunner):
         env_finalize: Callable[[], Any],
         progress_report_interval: float,
         callback: CallbackManager,
+        failure_policy: FailurePolicy = FailurePolicy.FAIL_FAST,
     ) -> None:
         """Initialize the MainProcessRunner.
 
@@ -50,12 +59,16 @@ class MainProcessRunner(BaseRunner):
                 progress updates.
             callback (CallbackManager): A callback manager that will be invoked at various points
                 during the data processing lifecycle.
+            failure_policy (FailurePolicy): What to do when the workload raises on a shard.
+                Defaults to stopping the run and raising.
         """
         self._batch_size = batch_size
         self._env_init = env_init
         self._env_finalize = env_finalize
         self._report_interval = progress_report_interval
         self._callback = callback
+        self._failure_policy = failure_policy
+        self._failures: list[ShardFailure] = []
 
     def run(
         self,
@@ -94,6 +107,7 @@ class MainProcessRunner(BaseRunner):
 
         # create the progress monitor
         monitor = ProgressMonitor(num_shards, 1, None, 0)
+        self._failures = []
 
         try:
             # call start callback
@@ -186,8 +200,20 @@ class MainProcessRunner(BaseRunner):
                     # handle exception
                     monitor._mark_worker_canceled(0)
                     self._callback.on_shard_canceled(monitor, shard_id)
-                    # log
-                    logger.error(f"Unexpected error during processing: {str(e)}.", exc_info=True)
+
+                    failure = ShardFailure(
+                        rank=0,
+                        shard_id=shard_id,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                        stack_trace=traceback.format_exc(),
+                    )
+                    self._failures.append(failure)
+                    logger.error(f"Processing failed: {failure}", exc_info=True)
+                    self._callback.on_exception(monitor, failure)
+
+                    if self._failure_policy is FailurePolicy.FAIL_FAST:
+                        break
 
                 else:
                     # call shard complete when no error was detected
@@ -230,3 +256,8 @@ class MainProcessRunner(BaseRunner):
             # done
             monitor._mark_as_done()
             self._callback.on_done(monitor)
+
+        if self._failures:
+            # Raised after finalization, so the writer has closed whatever it opened. The
+            # error names the shards that were not written.
+            raise ShardProcessingError(self._failures)

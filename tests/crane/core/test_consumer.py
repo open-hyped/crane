@@ -44,6 +44,7 @@ class TestDatasetConsumer(unittest.TestCase):
             env_finalize=mock_finalize,
             progress_report_interval=consumer._report_interval,
             callback=consumer._callback,
+            failure_policy=consumer._failure_policy,
         )
 
         # Ensure the run method was called with the dataset and function
@@ -92,6 +93,7 @@ class TestDatasetConsumer(unittest.TestCase):
             worker_finalize=mock_finalize,
             progress_report_interval=consumer._report_interval,
             callback=consumer._callback,
+            failure_policy=consumer._failure_policy,
         )
 
         # Ensure the run method was called with the dataset and function

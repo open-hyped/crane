@@ -14,7 +14,7 @@ from datasets.iterable_dataset import IterableDataset, identity_func
 
 from .callbacks.base import Callback, CallbackManager
 from .callbacks.tqdm_reporter import TqdmReporterCallback
-from .runners.base import BaseRunner
+from .runners.base import BaseRunner, FailurePolicy
 from .runners.main_process_runner import MainProcessRunner
 from .runners.multi_process_runner import DynamicMultiprocessingRunner
 
@@ -42,6 +42,7 @@ class DatasetConsumer(object):
         progress_report_interval: float = 0.5,
         disable_tqdm: bool = False,
         callbacks: list[Callback] = [],
+        failure_policy: FailurePolicy = FailurePolicy.FAIL_FAST,
     ) -> None:
         """Initialize the dataset consumer.
 
@@ -58,12 +59,15 @@ class DatasetConsumer(object):
                 False, meaning the progress bar is enabled.
             callbacks (list[Callback]): A list of callback functions that will be invoked at
                 various points during the data processing lifecycle.
+            failure_policy (FailurePolicy): What to do when the workload raises on a shard.
+                Defaults to stopping the run and raising :class:`ShardProcessingError`.
         """
         if not disable_tqdm:
             callbacks = callbacks + [TqdmReporterCallback(progress_report_interval)]
 
         self._num_proc = num_proc
         self._prefetch = prefetch_factor
+        self._failure_policy = failure_policy
 
         self._on_start = on_start
         self._on_finish = on_finish
@@ -101,6 +105,7 @@ class DatasetConsumer(object):
                 worker_finalize=self._on_finish,
                 progress_report_interval=self._report_interval,
                 callback=self._callback,
+                failure_policy=self._failure_policy,
             )
         else:
             logger.info("Running in single-process mode.")
@@ -111,6 +116,7 @@ class DatasetConsumer(object):
                 env_finalize=self._on_finish,
                 progress_report_interval=self._report_interval,
                 callback=self._callback,
+                failure_policy=self._failure_policy,
             )
 
         runner.run(ds, finalizer, batch_size, formatting)

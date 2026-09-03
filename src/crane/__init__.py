@@ -15,6 +15,9 @@ from .logging.setup import setup_logging
 __all__ = [
     "Callback",
     "DatasetConsumer",
+    "FailurePolicy",
+    "ShardFailure",
+    "ShardProcessingError",
     "ShardingStrategy",
     "TqdmReporterCallback",
     "JsonDatasetWriter",
@@ -25,7 +28,15 @@ __all__ = [
 
 from typing import TYPE_CHECKING
 
-from .core import Callback, DatasetConsumer, ShardingStrategy, TqdmReporterCallback
+from .core import (
+    Callback,
+    DatasetConsumer,
+    FailurePolicy,
+    ShardFailure,
+    ShardingStrategy,
+    ShardProcessingError,
+    TqdmReporterCallback,
+)
 
 if TYPE_CHECKING:  # pragma: not covered
     from .arrow import ArrowDatasetWriter

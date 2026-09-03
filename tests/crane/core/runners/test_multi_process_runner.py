@@ -10,8 +10,13 @@ import pytest
 from datasets import Dataset
 from datasets.iterable_dataset import SelectColumnsIterable
 
-from crane.core.callbacks.base import CallbackManager
-from crane.core.runners.base import WorkerProcessingStage, WorkerRole
+from crane.core.callbacks.base import Callback, CallbackManager
+from crane.core.runners.base import (
+    FailurePolicy,
+    ShardProcessingError,
+    WorkerProcessingStage,
+    WorkerRole,
+)
 from crane.core.runners.multi_process_runner import (
     Command,
     CommandType,
@@ -543,3 +548,91 @@ class TestCountedQueue:
         with pytest.raises(Full):
             queue.put("b", timeout=0.1)
         assert queue.get(timeout=5) == "a"
+
+
+def _raise_on_everything(x):
+    raise RuntimeError("workload failed")
+
+
+def _raise_on_one(x):
+    # Fails a single value, so the rest of the dataset is still processable.
+    if x["obj"] == 7:
+        raise RuntimeError("workload failed")
+    return x
+
+
+class TestWorkerFailures:
+    """A workload that raises must not look like a run that succeeded."""
+
+    def _runner(self, policy, callbacks=()):
+        return DynamicMultiprocessingRunner(
+            num_workers=2,
+            prefetch_factor=8,
+            worker_init=SharedMock(),
+            worker_finalize=SharedMock(),
+            progress_report_interval=0.0,
+            callback=CallbackManager(list(callbacks)),
+            failure_policy=policy,
+        )
+
+    @pytest.fixture
+    def ds(self):
+        return Dataset.from_dict({"obj": list(range(20))}).to_iterable_dataset(2)
+
+    def test_fail_fast_raises(self, ds):
+        # Before this, every worker logged its own traceback to its own stderr and the
+        # run reported success having written nothing.
+        runner = self._runner(FailurePolicy.FAIL_FAST)
+
+        with pytest.raises(ShardProcessingError) as excinfo:
+            runner.run(ds.map(_raise_on_everything), SharedMock())
+
+        assert excinfo.value.failures
+        assert excinfo.value.failures[0].error_type == "RuntimeError"
+        assert "workload failed" in excinfo.value.failures[0].stack_trace
+
+    def test_fail_fast_is_the_default(self, ds):
+        runner = DynamicMultiprocessingRunner(
+            num_workers=2,
+            prefetch_factor=8,
+            worker_init=SharedMock(),
+            worker_finalize=SharedMock(),
+            progress_report_interval=0.0,
+            callback=CallbackManager([]),
+        )
+
+        with pytest.raises(ShardProcessingError):
+            runner.run(ds.map(_raise_on_everything), SharedMock())
+
+    def test_skip_shard_keeps_the_rest_and_still_reports(self, ds):
+        runner = self._runner(FailurePolicy.SKIP_SHARD)
+        fn = SharedMock()
+
+        with pytest.raises(ShardProcessingError) as excinfo:
+            runner.run(ds.map(_raise_on_one), fn)
+
+        # the shard that did not contain the bad value was written
+        assert fn.call_count > 0
+        assert len(excinfo.value.failures) >= 1
+
+    def test_a_failure_reaches_the_callback(self, ds):
+        callback = MagicMock(wraps=Callback())
+        runner = self._runner(FailurePolicy.FAIL_FAST, callbacks=[callback])
+
+        with pytest.raises(ShardProcessingError):
+            runner.run(ds.map(_raise_on_everything), SharedMock())
+
+        assert callback.on_exception.called
+        failure = callback.on_exception.call_args[0][1]
+        assert failure.error_type == "RuntimeError"
+
+    def test_a_failing_shard_is_abandoned_not_retried(self, ds):
+        # The worker used to leave `stream_exhausted` false after reporting, so it ran the
+        # same failing context again, forever. A handful of failures is a shard being
+        # given up on; hundreds is that loop.
+        runner = self._runner(FailurePolicy.SKIP_SHARD)
+
+        with pytest.raises(ShardProcessingError) as excinfo:
+            runner.run(ds.map(_raise_on_everything), SharedMock())
+
+        assert len(excinfo.value.failures) <= 8, "the same shard is being retried"

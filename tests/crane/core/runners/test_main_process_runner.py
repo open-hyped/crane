@@ -5,6 +5,7 @@ from datasets import Dataset
 
 from crane.core.callbacks.base import CallbackManager
 from crane.core.monitor import ProgressMonitor
+from crane.core.runners.base import FailurePolicy, ShardProcessingError
 from crane.core.runners.main_process_runner import MainProcessRunner
 
 
@@ -55,7 +56,35 @@ class TestMainProcessRunner:
         fn.assert_called_once()
 
     def test_run_with_exception(self, runner, ds):
+        # The workload raising is now a failed run rather than a logged line: the default
+        # policy stops and raises, so a caller cannot mistake a partial dataset for a
+        # complete one.
         fn = MagicMock(side_effect=RuntimeError)
-        runner.run(ds, fn)
+
+        with pytest.raises(ShardProcessingError) as excinfo:
+            runner.run(ds, fn)
 
         fn.assert_called_once()
+        assert excinfo.value.failures[0].error_type == "RuntimeError"
+
+    def test_run_with_exception_skipping_shards(self):
+        # The old behaviour, now something the caller opts into: carry on past a bad
+        # shard, and hear about it at the end. Three shards, so "carried on" is
+        # distinguishable from "stopped at the first".
+        ds = Dataset.from_dict({"obj": list(range(20))}).to_iterable_dataset(3)
+        runner = MainProcessRunner(
+            batch_size=8,
+            env_init=MagicMock(),
+            env_finalize=MagicMock(),
+            progress_report_interval=0.0,
+            callback=CallbackManager([]),
+            failure_policy=FailurePolicy.SKIP_SHARD,
+        )
+        fn = MagicMock(side_effect=RuntimeError)
+
+        with pytest.raises(ShardProcessingError) as excinfo:
+            runner.run(ds, fn)
+
+        # every shard was attempted, rather than stopping at the first
+        assert len(excinfo.value.failures) == 3
+        assert {f.shard_id for f in excinfo.value.failures} == {0, 1, 2}

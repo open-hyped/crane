@@ -49,7 +49,14 @@ from ..iterables import (
 from ..monitor import ProgressMonitor, ProgressReport
 from ..utils import clock
 from ..worker import set_worker_info
-from .base import BaseRunner, WorkerProcessingStage, WorkerRole
+from .base import (
+    BaseRunner,
+    FailurePolicy,
+    ShardFailure,
+    ShardProcessingError,
+    WorkerProcessingStage,
+    WorkerRole,
+)
 
 # shorthands and helper type aliases
 Stages: TypeAlias = WorkerProcessingStage
@@ -838,6 +845,11 @@ class Worker(mp.Process):
                                 "stack_trace": traceback.format_exc(),
                             },
                         )
+                        # Give this context up rather than running it again. The workload
+                        # raised on this data and would raise on it again, so retrying is
+                        # an endless loop that reports the same failure forever.
+                        self._send_msg(MessageType.CTX_CANCELED)
+                        stream_exhausted = True
 
         except KeyboardInterrupt:
             self._logger.warning("Worker interrupted by user.")
@@ -1183,6 +1195,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         worker_finalize: Callable[[], Any],
         progress_report_interval: float,
         callback: CallbackManager,
+        failure_policy: FailurePolicy = FailurePolicy.FAIL_FAST,
     ) -> None:
         """Initialize the multiprocessing runner.
 
@@ -1199,6 +1212,8 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 progress updates.
             callback (CallbackManager): A callback manager that will be invoked at various points
                 during the data processing lifecycle.
+            failure_policy (FailurePolicy): What to do when the workload raises on a shard.
+                Defaults to stopping the run and raising.
         """
         self._num_workers = num_workers
         self._prefetch = prefetch_factor
@@ -1208,6 +1223,8 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         self._report_interval = progress_report_interval
         self._callback = callback
+        self._failure_policy = failure_policy
+        self._failures: list[ShardFailure] = []
 
         self._logger = logging.getLogger(f"{type(self).__module__}.{type(self).__qualname__}")
 
@@ -1393,6 +1410,26 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
                 _close_stream_if_finished()
 
+            elif msg_type is MessageType.EXCEPTION:
+                # The worker has given this shard up and will ask for another; what the
+                # run does about it is this policy's business.
+                failure = ShardFailure(
+                    rank=rank,
+                    shard_id=monitor.get_worker_shard(rank),
+                    error_type=payload["error_type"],
+                    error_message=payload["error_message"],
+                    stack_trace=payload["stack_trace"],
+                )
+                self._failures.append(failure)
+                self._logger.error(f"Processing failed: {failure}\n{failure.stack_trace}")
+                self._callback.on_exception(monitor, failure)
+
+                if (self._failure_policy is FailurePolicy.FAIL_FAST) and (not monitor.is_stopping):
+                    self._logger.error("Failure policy is fail-fast, stopping all workers.")
+                    monitor._mark_as_stopping()
+                    self._callback.on_stopping(monitor)
+                    controller.stop_all()
+
             elif msg_type is MessageType.CTX_SWITCH:
                 # parse payload
                 old_role, new_role = payload
@@ -1495,6 +1532,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 to the finalizer function.
         """
         self._logger.info("Starting data processing.")
+        self._failures = []
 
         num_shards = ds.n_shards
         # prepare the dataset
@@ -1593,5 +1631,11 @@ class DynamicMultiprocessingRunner(BaseRunner):
             self._callback.on_done(monitor)
             controller.assert_all_workers_joined()
             msg_queue.close()
+
+        if self._failures:
+            # Raised after the workers are joined, so the failure does not leave processes
+            # behind. Under SKIP_SHARD the rest of the dataset was still written; the
+            # error names the shards that were not.
+            raise ShardProcessingError(self._failures)
 
         self._logger.info("Runner complete.")

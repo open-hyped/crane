@@ -9,6 +9,7 @@ processing, including starting, shard completion, and stopping of tasks.
 from datasets import IterableDataset
 
 from ..monitor import ProgressMonitor
+from ..runners.base import ShardFailure
 
 
 class Callback(object):
@@ -52,6 +53,19 @@ class Callback(object):
         Args:
             monitor (ProgressMonitor): The monitor tracking the task's progress.
             shard_id (int): The identifier of the canceled shard.
+        """
+        ...  # pragma: not covered
+
+    def on_exception(self, monitor: ProgressMonitor, failure: ShardFailure) -> None:
+        """Called when the workload raised while processing a shard.
+
+        Whether the run then stops or carries on is the runner's failure policy, not this
+        callback's; this is only told that it happened.
+
+        Args:
+            monitor (ProgressMonitor): The monitor tracking the task's progress.
+            failure (ShardFailure): The worker that raised, the shard it held, and the
+                traceback from inside that worker.
         """
         ...  # pragma: not covered
 
@@ -127,6 +141,16 @@ class CallbackManager(Callback):
         """
         for callback in self._callbacks:
             callback.on_shard_canceled(monitor, shard_id)
+
+    def on_exception(self, monitor: ProgressMonitor, failure: ShardFailure) -> None:
+        """Calls the on_exception method of each registered callback.
+
+        Args:
+            monitor (ProgressMonitor): The monitor tracking the task's progress.
+            failure (ShardFailure): The failure that was reported.
+        """
+        for callback in self._callbacks:
+            callback.on_exception(monitor, failure)
 
     def on_stopping(self, monitor: ProgressMonitor) -> None:
         """Calls the on_stopping method of each registered callback.

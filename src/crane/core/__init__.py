@@ -10,11 +10,15 @@ __all__ = [
     "DatasetConsumer",
     "BaseDatasetWriter",
     "Callback",
+    "FailurePolicy",
+    "ShardFailure",
+    "ShardProcessingError",
     "TqdmReporterCallback",
 ]
 
 from .callbacks.base import Callback
 from .callbacks.tqdm_reporter import TqdmReporterCallback
 from .consumer import DatasetConsumer
+from .runners.base import FailurePolicy, ShardFailure, ShardProcessingError
 from .sharding import ShardingStrategy
 from .writer import BaseDatasetWriter
