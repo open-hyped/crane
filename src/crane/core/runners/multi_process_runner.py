@@ -62,6 +62,12 @@ Stages: TypeAlias = WorkerProcessingStage
 _CTX_SEND_TIMEOUT: float = 1.0
 _CTX_SEND_RETRY_INTERVAL: float = 0.01
 
+# How long to wait for room when posting an end-of-stream sentinel. Once no more data can
+# be produced the queue only ever drains, so a short block is enough to ride out a queue
+# that happens to be full at that instant - and it is bounded, because the controller
+# gives up after the first failure and retries on its next message instead.
+_SENTINEL_PUT_TIMEOUT: float = 0.5
+
 # The lazy processing steps that `_prepare_dataset` separates from the data source.
 # `FormattedExamplesIterable` was introduced in newer `datasets` releases (it is inserted
 # into the iterable chain by `.map`); guard the import so crane keeps working on versions
@@ -854,6 +860,11 @@ class WorkerController(object):
         self.producer_ranks = set()
         self.consumer_ranks = set()
         self.joined_ranks = set()
+        # Consumers already handed an end-of-stream sentinel. Sentinels are not addressed
+        # to a rank - any consumer takes any of them - so this is really a count of how
+        # many are still owed, kept per rank so that `free_worker` can clear it when a
+        # worker leaves the role and may later re-enter it.
+        self.sentinel_sent_ranks = set()
         self._logger = logging.getLogger(f"{type(self).__module__}.{type(self).__qualname__}")
 
     @property
@@ -1015,24 +1026,41 @@ class WorkerController(object):
         Only safe once no further data can appear - the caller establishes that; see
         `_release_finished_consumers`.
 
+        A sentinel that cannot be posted must not simply be forgotten. The queue holds one
+        item per worker, so at the moment the end is detected it may still be full of real
+        data; dropping the attempt then leaves those consumers to discover the end by
+        timing out, which is exactly the 30 s stall this exists to prevent. It showed up in
+        benchmarks as a rare but severe collapse - most runs at 5185 documents/s, an
+        occasional one at 319, the difference being a multiple of 30 s. So each consumer is
+        tracked until it has actually been given one, a short block absorbs a queue that is
+        merely busy, and whatever is still owed is retried on the controller's next message.
+
         Returns:
-            int: The number of sentinels posted.
+            int: The number of sentinels posted by this call.
         """
         posted = 0
-        for _ in tuple(self.consumer_ranks):
+        for rank in tuple(self.consumer_ranks):
+            if rank in self.sentinel_sent_ranks:
+                continue
             try:
-                self.queue.put_nowait(self.queue_it.sentinel)
+                self.queue.put(self.queue_it.sentinel, timeout=_SENTINEL_PUT_TIMEOUT)
             except Full:
-                # The queue holds at most one item per worker. A full queue means the
-                # consumers still have data to get through, and they will be released by
-                # a later call once they have drained it.
+                # Still busy. Leave the rest owed rather than blocking the controller
+                # any longer; the next message retries.
+                self._logger.debug("Data queue full while posting sentinels; will retry.")
                 break
+            self.sentinel_sent_ranks.add(rank)
             posted += 1
 
         if posted > 0:
             self._logger.debug(f"Posted {posted} end-of-stream sentinels to the data queue.")
 
         return posted
+
+    @property
+    def consumers_awaiting_sentinel(self) -> set[int]:
+        """Consumers that are owed an end-of-stream sentinel and have not had one."""
+        return self.consumer_ranks - self.sentinel_sent_ranks
 
     def free_worker(self, rank: int) -> None:
         """Removes the worker from any active roles.
@@ -1043,6 +1071,8 @@ class WorkerController(object):
         self.standalone_ranks -= {rank}
         self.producer_ranks -= {rank}
         self.consumer_ranks -= {rank}
+        # If it becomes a consumer again it needs a sentinel of its own.
+        self.sentinel_sent_ranks -= {rank}
 
     def stop_worker(self, rank: int) -> None:
         """Sends a stop signal to a worker, indicating that it should cease operation.
@@ -1318,6 +1348,17 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 return
             controller.signal_no_more_data()
 
+        def _retry_owed_sentinels() -> None:
+            """Deliver any sentinel a full queue prevented from going out earlier.
+
+            Cheap to call on every message, and it has to be: once every worker is a
+            consumer blocked on a drained queue, no further message will arrive to
+            prompt a retry, so the retries have to happen while messages are still
+            flowing.
+            """
+            if controller.consumers_awaiting_sentinel:
+                _release_finished_consumers()
+
         done = False
         while not done:
             # receive message from worker
@@ -1327,6 +1368,8 @@ class DynamicMultiprocessingRunner(BaseRunner):
             rank: int = msg["rank"]
             msg_type = MessageType(msg["type"])
             payload = msg["payload"]
+
+            _retry_owed_sentinels()
 
             # handle message
             if msg_type is MessageType.READY:

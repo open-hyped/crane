@@ -690,3 +690,47 @@ class TestContextPartCache:
         assert received.data_transform is _a_transform
         assert received.data_finalizer is _a_finalizer
         assert received.data_finalizer_batch_size == 8
+
+
+class TestSentinelDelivery:
+    """A sentinel that could not be posted is owed, not forgotten."""
+
+    def test_a_full_queue_leaves_the_sentinel_owed(self):
+        # The queue holds one item per worker, so at the moment the end is detected it
+        # can still be full of real data. Dropping the attempt there left consumers to
+        # discover the end by timing out - the 30 s stall this whole mechanism exists to
+        # remove, reappearing as a rare but severe collapse.
+        controller = WorkerController(workers=[MagicMock()], prefetch=8, num_shards=1)
+        controller.consumer_ranks = {0}
+        controller.queue.put_nowait("data")  # maxsize is one worker, so now full
+
+        assert controller.signal_no_more_data() == 0
+        assert controller.consumers_awaiting_sentinel == {0}
+
+        controller.queue.get_nowait()  # the consumer drains it
+
+        assert controller.signal_no_more_data() == 1
+        assert controller.consumers_awaiting_sentinel == set()
+        assert controller.queue.get_nowait() is controller.queue_it.sentinel
+
+    def test_a_consumer_is_not_sent_two_sentinels(self):
+        controller = WorkerController(workers=[MagicMock(), MagicMock()], prefetch=8, num_shards=1)
+        controller.consumer_ranks = {0}
+
+        assert controller.signal_no_more_data() == 1
+        assert controller.signal_no_more_data() == 0
+        assert controller.queue.qsize() == 1
+
+    def test_a_worker_re_entering_the_role_is_owed_another(self):
+        # Freeing a worker and giving it the consumer role again is a fresh consumer
+        # blocked on the queue, so the earlier sentinel does not cover it.
+        controller = WorkerController(workers=[MagicMock()], prefetch=8, num_shards=1)
+        controller.consumer_ranks = {0}
+        controller.signal_no_more_data()
+        controller.queue.get_nowait()
+
+        controller.free_worker(0)
+        controller.consumer_ranks = {0}
+
+        assert controller.consumers_awaiting_sentinel == {0}
+        assert controller.signal_no_more_data() == 1
