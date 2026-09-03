@@ -19,7 +19,7 @@ import multiprocessing as mp
 import multiprocessing.connection  # noqa: F401
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
 from queue import Empty, Full
@@ -277,6 +277,10 @@ class Worker(mp.Process):
         # the worker context including the pipeline
         # to be executed by the worker
         self._ctx = WorkerContext()
+        # The transform this worker was last known to have *received*. Contexts are sent
+        # once per shard assignment but the transform rarely changes, and re-serialising
+        # it every time is expensive; see `_without_unchanged_transform`.
+        self._last_transform: None | Callable = None
 
         # create logger
         self._logger = logging.getLogger(f"{type(self).__module__}.{type(self).__qualname__}")
@@ -315,8 +319,13 @@ class Worker(mp.Process):
             self._recv_ctx_resp_conn.recv()
 
         # serialize and send context
+        ctx, transform = self._without_unchanged_transform(ctx)
         ctx_bytes = dill.dumps(ctx)
-        self._send_ctx_bytes(ctx_bytes)
+        if self._send_ctx_bytes(ctx_bytes):
+            # Only now is the worker known to have it. Recording delivery for a context
+            # that was dropped would strip the transform from every later context too,
+            # leaving the worker with no pipeline at all.
+            self._last_transform = transform
 
         if blocking:
             # wait for feedback from worker
@@ -331,7 +340,38 @@ class Worker(mp.Process):
             self._logger.debug(f"Sent new context to worker {self._rank} in non-blocking mode.")
             return True
 
-    def _send_ctx_bytes(self, ctx_bytes: bytes, timeout: float = _CTX_SEND_TIMEOUT) -> None:
+    def _without_unchanged_transform(
+        self, ctx: WorkerContext
+    ) -> tuple[WorkerContext, None | Callable]:
+        """Drop `data_transform` from a context whose worker already holds it.
+
+        The transform closes over whatever the workload needs, and for a tokenising
+        pipeline that is the tokenizer - measured at 5.7 MB and 0.8 s to pickle. A
+        context is sent once per shard assignment, so a 64-shard run spent ~50 s doing
+        nothing but re-serialising an object that never changed. Worse, `dill.dumps`
+        runs on the controller's single-threaded message loop, so while it worked every
+        other worker asking for its next shard was kept waiting: workers were measured
+        idle 52% of the time.
+
+        `WorkerContext.apply_ctx` keeps the previous value for any field arriving as
+        None, and the worker's `_ctx` persists across contexts, so omitting an unchanged
+        transform is exactly equivalent to sending it again.
+
+        The comparison is by identity rather than an unconditional blanking, because a
+        producer context carries a *different* transform and a role switch must still
+        deliver it.
+
+        Returns:
+            tuple[WorkerContext, None | Callable]: the context to send, and the
+            transform the worker will hold once it arrives.
+        """
+        if ctx.data_transform is None:
+            return ctx, self._last_transform
+        if ctx.data_transform is self._last_transform:
+            return replace(ctx, data_transform=None), self._last_transform
+        return ctx, ctx.data_transform
+
+    def _send_ctx_bytes(self, ctx_bytes: bytes, timeout: float = _CTX_SEND_TIMEOUT) -> bool:
         """Replace whatever context is queued for the worker with `ctx_bytes`.
 
         The queue holds at most one pending context, so a stale one is dropped first.
@@ -345,6 +385,9 @@ class Worker(mp.Process):
         Retry within a deadline instead, and treat exhaustion as a dropped context rather
         than a fatal error: the balancer sends these continuously, so the next one will
         carry the same information.
+
+        Returns:
+            bool: Whether the context reached the worker's queue.
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -355,7 +398,7 @@ class Worker(mp.Process):
 
             try:
                 self._ctx_queue.put_nowait(ctx_bytes)
-                return
+                return True
             except Full:
                 if time.monotonic() >= deadline:
                     self._logger.warning(
@@ -363,7 +406,7 @@ class Worker(mp.Process):
                         f"{timeout}s; the worker is not consuming its context queue. "
                         f"Dropping this context."
                     )
-                    return
+                    return False
                 time.sleep(_CTX_SEND_RETRY_INTERVAL)
 
     def _send_msg(self, msg_type: MessageType, payload: None | Any = None) -> None:
@@ -842,6 +885,39 @@ class WorkerController(object):
                 return rank
             self._logger.info(f"Worker {rank} did not accept processor context.")
 
+    def signal_no_more_data(self) -> int:
+        """Post the queue's end-of-stream sentinel, one for each consumer.
+
+        `QueueExamplesIterable` leaves a drained queue either on the sentinel or, failing
+        that, once its `get` times out after 30 s - and nothing anywhere ever posted the
+        sentinel, so waiting out the timeout in full was a consumer's only way to finish.
+        That is the ordinary end of every run rather than an edge case: once the shard
+        pool empties, every worker still alive is made a consumer, so a run paid 30 s per
+        consumer round *after* its real work was already done. Measured on a 4-worker
+        run whose 8 shards were finished at t=18 s, the run did not end until t=76 s.
+
+        Only safe once no further data can appear - the caller establishes that; see
+        `_release_finished_consumers`.
+
+        Returns:
+            int: The number of sentinels posted.
+        """
+        posted = 0
+        for _ in tuple(self.consumer_ranks):
+            try:
+                self.queue.put_nowait(self.queue_it.sentinel)
+            except Full:
+                # The queue holds at most one item per worker. A full queue means the
+                # consumers still have data to get through, and they will be released by
+                # a later call once they have drained it.
+                break
+            posted += 1
+
+        if posted > 0:
+            self._logger.debug(f"Posted {posted} end-of-stream sentinels to the data queue.")
+
+        return posted
+
     def free_worker(self, rank: int) -> None:
         """Removes the worker from any active roles.
 
@@ -1111,6 +1187,21 @@ class DynamicMultiprocessingRunner(BaseRunner):
         switching_worker: None | int = None
         last_switch = clock()
 
+        def _release_finished_consumers() -> None:
+            """Tell the consumers the data has run out, when it actually has.
+
+            A consumer blocked on the shared queue cannot distinguish "empty for now"
+            from "empty for good" - that is what the sentinel is for. The condition for
+            posting it is that nothing can produce again: no shard is waiting to be
+            assigned, no worker is producing, and no standalone worker is left that
+            `try_switch_standalone_to_producer` could still promote into one.
+            """
+            if monitor.any_pending_shards:
+                return
+            if controller.any_producers or controller.standalone_ranks:
+                return
+            controller.signal_no_more_data()
+
         done = False
         while not done:
             # receive message from worker
@@ -1130,7 +1221,13 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 controller.join_worker(rank)
                 monitor._mark_worker_done(rank)
                 self._logger.debug(f"Worker {rank} done.")
-                done = not monitor.any_worker_alive
+                # Every worker reports DONE from its `finally`, so counting them is the
+                # one condition that cannot end the loop early. `any_worker_alive` looks
+                # equivalent but is not: a worker is only marked alive once it reports
+                # READY, so a run short enough to finish before a straggler has started
+                # would see "nobody alive" and leave that worker unjoined. That used to
+                # be unreachable only because every run sat out the consumer timeout.
+                done = len(controller.joined_ranks) == controller.num_workers
 
             elif msg_type is MessageType.CTX_STARTED:
                 # update monitor state
@@ -1159,6 +1256,8 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     # run the callback
                     self._callback.on_shard_completed(monitor, shard_id)
 
+                _release_finished_consumers()
+
             elif msg_type is MessageType.CTX_CANCELED:
                 if monitor.get_worker_role(rank) is WorkerRole.PRODUCER:
                     # try to start another producer shard to replace this one
@@ -1174,6 +1273,8 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 if shard_id is not None:
                     # run the callback
                     self._callback.on_shard_canceled(monitor, shard_id)
+
+                _release_finished_consumers()
 
             elif msg_type is MessageType.CTX_SWITCH:
                 # parse payload
@@ -1256,6 +1357,11 @@ class DynamicMultiprocessingRunner(BaseRunner):
                         finalizer_batch_size=finalizer_batch_size,
                         finalizer_formatting=finalizer_formatting,
                     )
+
+                    # A worker joining as a consumer after the data has already run
+                    # out needs its own sentinel, or it would sit out the full timeout
+                    # on a queue that will never fill again.
+                    _release_finished_consumers()
 
                     # evenutally all workers are consumers
                     if monitor.alive_workers == controller.consumer_ranks:

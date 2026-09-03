@@ -1,5 +1,6 @@
 import json
 import multiprocessing as mp
+import time
 from queue import Full
 from unittest.mock import MagicMock, call, patch
 
@@ -17,6 +18,7 @@ from crane.core.runners.multi_process_runner import (
     MessageType,
     Worker,
     WorkerContext,
+    WorkerController,
 )
 from tests.third_party.sharedmock.mock import SharedMock
 
@@ -417,3 +419,125 @@ class TestDynamicMultiprocessingRunner:
         expected = [v for _, v in pipeline(src_ex_it)]
         actual = list(mapped_ds)
         assert actual == expected
+
+
+def _a_transform(ex_iterable):
+    return ex_iterable
+
+
+def _another_transform(ex_iterable):
+    return ex_iterable
+
+
+def _standalone_ctx(transform):
+    return WorkerContext(
+        role=WorkerRole.STANDALONE,
+        data_stream="STREAM",
+        data_transform=transform,
+    )
+
+
+def _capture_sent(store):
+    def capture(ctx_bytes, **kwargs):
+        store.append(dill.loads(ctx_bytes))
+        return True
+
+    return capture
+
+
+class TestWorkerContextReuse:
+    """A worker is told its transform once, not once per shard."""
+
+    @pytest.fixture
+    def worker(self):
+        queue = mp.Queue()
+        worker = Worker(
+            rank=0,
+            num_workers=1,
+            msg_queue=queue,
+            progress_report_interval=0.0,
+            worker_init=MagicMock(),
+            worker_finalize=MagicMock(),
+        )
+        yield worker
+        queue.close()
+
+    def test_omits_a_transform_the_worker_already_has(self, worker):
+        # The transform closes over the workload - a tokenizer, in the case that
+        # motivated this - and re-pickling it on every shard assignment made the
+        # single-threaded controller the bottleneck. `apply_ctx` keeps the previous
+        # value for any field arriving as None, so leaving it out is equivalent.
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
+            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
+
+        assert sent[0].data_transform is not None
+        assert sent[1].data_transform is None
+
+    def test_sends_a_transform_that_actually_changed(self, worker):
+        # A producer context carries a different transform, so the check has to be by
+        # identity rather than a blanket blanking of every repeat context.
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
+            worker.send_ctx(_standalone_ctx(_another_transform), blocking=False)
+
+        assert sent[0].data_transform is not None
+        assert sent[1].data_transform is not None
+
+    def test_resends_a_transform_whose_context_was_dropped(self, worker):
+        # A dropped context never reached the worker, so it does not hold that transform
+        # and the next context must still carry it - otherwise it is left with no
+        # pipeline at all.
+        with patch.object(worker, "_send_ctx_bytes", return_value=False):
+            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
+
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
+
+        assert sent[0].data_transform is not None
+
+
+class TestConsumerShutdown:
+    """Consumers are told the data ran out instead of inferring it from a timeout."""
+
+    def test_signal_no_more_data_posts_one_sentinel_per_consumer(self):
+        controller = WorkerController(
+            workers=[MagicMock(), MagicMock(), MagicMock()], prefetch=8, num_shards=2
+        )
+        controller.consumer_ranks = {0, 1}
+
+        assert controller.signal_no_more_data() == 2
+        assert controller.queue.get_nowait() is controller.queue_it.sentinel
+        assert controller.queue.get_nowait() is controller.queue_it.sentinel
+        assert controller.queue.empty()
+
+    def test_signal_no_more_data_is_a_no_op_without_consumers(self):
+        controller = WorkerController(workers=[MagicMock()], prefetch=8, num_shards=1)
+
+        assert controller.signal_no_more_data() == 0
+        assert controller.queue.empty()
+
+    def test_run_does_not_wait_out_the_queue_timeout(self):
+        # `QueueExamplesIterable` gives up on a drained queue after 30 s, and nothing
+        # used to post the sentinel that would end it sooner - so every run paid that
+        # timeout, once per consumer round, after all its real work was done.
+        runner = DynamicMultiprocessingRunner(
+            num_workers=2,
+            prefetch_factor=8,
+            worker_init=SharedMock(),
+            worker_finalize=SharedMock(),
+            progress_report_interval=0.0,
+            callback=CallbackManager([]),
+        )
+        ds = Dataset.from_dict({"obj": list(range(20))}).to_iterable_dataset(2)
+
+        fn = SharedMock()
+        start = time.perf_counter()
+        runner.run(ds, fn)
+        elapsed = time.perf_counter() - start
+
+        fn.assert_has_calls([call(sample) for sample in ds], same_order=False)
+        assert elapsed < 20, f"run took {elapsed:.1f}s, suggesting it sat out the queue timeout"
