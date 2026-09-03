@@ -4,14 +4,19 @@ The :class:`ParquetDatasetWriter` class writes dataset samples to individual Par
 files, with each worker writing a separate shard.
 """
 
+import glob
+import logging
 from typing import Any
 
+import datasets
 import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import DatasetInfo
 
 from .core import BaseDatasetWriter
 from .core.worker import get_worker_info
+
+logger = logging.getLogger(__name__)
 
 
 class ParquetDatasetWriter(BaseDatasetWriter):
@@ -34,6 +39,18 @@ class ParquetDatasetWriter(BaseDatasetWriter):
         writer.write(ds)
 
         ds = datasets.load_dataset("parquet", data_dir="./data", split="train")
+
+    A `_metadata` file summarising every shard is written alongside, so a Parquet reader
+    can plan a scan of the whole directory without opening each shard first:
+
+    .. code-block:: python
+
+        import pyarrow.dataset as pds
+
+        table = pds.parquet_dataset("./data/_metadata").to_table()
+
+    Note that pointing a reader at the directory itself does not work - it would try to
+    parse `dataset_info.json` as Parquet. Use `_metadata`, or a `shard-*.parquet` glob.
     """
 
     def __init__(
@@ -41,6 +58,7 @@ class ParquetDatasetWriter(BaseDatasetWriter):
         save_dir: str,
         compression: str = "snappy",
         row_group_size: None | int = None,
+        write_metadata: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize the :class:`ParquetDatasetWriter`.
@@ -56,12 +74,16 @@ class ParquetDatasetWriter(BaseDatasetWriter):
                 are the unit a reader can skip, so smaller groups make selective reads
                 cheaper and the file slightly larger. Defaults to None, which lets
                 PyArrow write one row group per batch handed to it.
+            write_metadata (bool): Whether to write a `_metadata` file summarising every
+                shard once the run finishes. Defaults to True; see
+                :func:`finalize_dataset` for what it buys and what it costs.
             **kwargs (Any): Forwarded to :class:`BaseDatasetWriter`, which documents the
                 sharding, parallelism and progress options shared by every writer.
         """
         super(ParquetDatasetWriter, self).__init__(save_dir, **kwargs)
         self._compression = compression
         self._row_group_size = row_group_size
+        self._write_metadata = write_metadata
 
     def initialize_shard(self, shard_id: int, info: DatasetInfo) -> None:
         """Initialize a new Parquet writer shard.
@@ -132,3 +154,42 @@ class ParquetDatasetWriter(BaseDatasetWriter):
         worker_info = get_worker_info()
         worker_info.ctx.writer.close()
         worker_info.ctx.file.close()
+
+    def finalize_dataset(self, ds: datasets.IterableDataset) -> None:
+        """Write a `_metadata` file summarising every shard.
+
+        `_metadata` is a footer-only Parquet file holding each shard's row-group metadata
+        with its path attached. A reader handed the directory can plan a scan of the whole
+        dataset from that one file, instead of opening every shard to learn the schema,
+        the row counts and the row-group statistics - and it can then skip shards using
+        statistics it has not had to read. `dataset_info.json` and `state.json` are
+        written as for any other crane writer; this is additional, not a replacement.
+
+        The shards are written by different processes, so their metadata cannot simply be
+        accumulated as they go. It is gathered here instead, by reading each footer back
+        now that they all exist. A footer is the tail of a file rather than its data, so
+        this costs one small read per shard, once.
+
+        Args:
+            ds (datasets.IterableDataset): The dataset that was written.
+        """
+        if not self._write_metadata:
+            return
+
+        shard_paths = sorted(glob.glob("shard-*.parquet"))
+        if not shard_paths:
+            # Nothing was written. A `_metadata` here would describe an empty dataset as
+            # though that were the intended result; leave it out so the directory looks
+            # as empty as it is.
+            logger.warning("No shards were written, skipping the parquet metadata file.")
+            return
+
+        metadata = []
+        for path in shard_paths:
+            shard_metadata = pq.read_metadata(path)
+            # The path a reader resolves, relative to the directory holding `_metadata`.
+            shard_metadata.set_file_path(path)
+            metadata.append(shard_metadata)
+
+        pq.write_metadata(metadata[0].schema.to_arrow_schema(), "_metadata", metadata)
+        logger.info(f"Wrote parquet metadata for {len(shard_paths)} shards.")
