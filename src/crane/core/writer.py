@@ -312,6 +312,25 @@ class BaseDatasetWriter(ABC):
             # write dataset info and state
             self._write_state(ds)
             self._write_info(ds)
+            # give the writer a look at the finished dataset as a whole
+            self.finalize_dataset(ds)
+
+    def finalize_dataset(self, ds: datasets.IterableDataset) -> None:
+        """Called once after every shard of a split has been written.
+
+        Runs in the main process, after :func:`_write_state` and :func:`_write_info`, with
+        the working directory set to the split's save directory. Unlike
+        :func:`finalize_shard`, which each worker runs for its own shard, this is the only
+        point at which the complete set of shards exists and is visible to one process -
+        the place for anything needing a whole-dataset view, such as an index, a manifest
+        or a checksum.
+
+        Does nothing by default.
+
+        Args:
+            ds (datasets.IterableDataset): The dataset that was written.
+        """
+        return  # pragma: not covered
 
     def write(self, ds: DatasetType) -> None:
         """Write the entire dataset or dataset dictionary to disk.
