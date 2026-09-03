@@ -128,13 +128,16 @@ def _is_separable(ex_iterable: _BaseExamplesIterable) -> bool:
 class _CountedQueue:
     """An `mp.Queue` that can report its own length on every platform.
 
-    The runner previously used a `mp.Manager().Queue()`, because `mp.Queue.qsize()` is
-    backed by `sem_getvalue()` and macOS does not implement it. That fix was expensive:
-    a manager queue is a proxy served by a separate process, so every batch of data is
+    The runner used a `mp.Manager().Queue()` from its first commit. That is expensive: a
+    manager queue is a proxy served by a separate process, so every batch of data is
     pickled, shipped over a socket, held in that process, then pickled again on its way
     to the consumer - and the progress monitor polls `qsize()` every 10 ms, which on a
     proxy is another socket round-trip a hundred times a second, competing with the data
     it is measuring.
+
+    What stood in the way of simply swapping in a plain `mp.Queue` is that the balancer
+    needs the queue's depth, and `mp.Queue.qsize()` is backed by `sem_getvalue()`, which
+    macOS does not implement.
 
     Counting puts and gets ourselves keeps a plain `mp.Queue` - one pickle, one pipe, no
     intermediary - and gives an accurate length on macOS too. The count trails reality
