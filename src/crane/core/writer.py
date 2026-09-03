@@ -30,6 +30,7 @@ from datasets.iterable_dataset import (
 
 from .callbacks.base import Callback
 from .consumer import DatasetConsumer
+from .runners.base import FailurePolicy
 from .sharding import ShardingController, ShardingStrategy
 from .utils import Compose, FormatType, RunAll, chdir
 
@@ -102,6 +103,7 @@ class BaseDatasetWriter(ABC):
         max_shard_size: None | int | str = "5GB",
         sample_size_key: None | str = None,
         callbacks: list[Callback] = [],
+        failure_policy: FailurePolicy = FailurePolicy.FAIL_FAST,
     ) -> None:
         """Initialize the :class:`BaseDatasetWriter`.
 
@@ -127,6 +129,10 @@ class BaseDatasetWriter(ABC):
             sample_size_key (None | str): The key in the dataset sample to measure size if using
                 the :class:`SAMPLE_ITEM` sharding strategy.
             callbacks (list[Callback]): List of callbacks.
+            failure_policy (FailurePolicy): What to do when the workload raises on a shard.
+                Defaults to :attr:`FailurePolicy.FAIL_FAST`, which stops the run and raises
+                :class:`ShardProcessingError` rather than leaving a partial dataset that
+                looks complete.
         """
         self.save_dir = save_dir
         self._overwrite = overwrite
@@ -142,6 +148,7 @@ class BaseDatasetWriter(ABC):
         self._sample_size_key = sample_size_key
         # callbacks
         self._callbacks = callbacks
+        self._failure_policy = failure_policy
 
     def _write_info(self, ds: datasets.IterableDataset) -> None:
         """Write dataset information to a JSON file in the save directory.
@@ -296,6 +303,7 @@ class BaseDatasetWriter(ABC):
                 progress_report_interval=self._tqdm_update_interval,
                 disable_tqdm=self._disable_tqdm,
                 callbacks=self._callbacks,
+                failure_policy=self._failure_policy,
             )
             consumer.consume(
                 ds, finalizer=write_fn, batch_size=self._write_batch_size, formatting=formatting
