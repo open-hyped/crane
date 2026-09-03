@@ -19,6 +19,7 @@ from crane.core.runners.multi_process_runner import (
     Worker,
     WorkerContext,
     WorkerController,
+    INHERITED_TRANSFORM,
     _ContextPartCache,
     _CountedQueue,
     _PrePickled,
@@ -511,6 +512,63 @@ class TestWorkerContextReuse:
         assert sent[0].data_transform is not None
 
 
+def _a_finalizer(batch):
+    return None
+
+
+def _another_finalizer(batch):
+    return None
+
+
+class TestFinalizerReuse:
+    """The finalizer is re-sent only when it, or how it is called, actually changes."""
+
+    @pytest.fixture
+    def worker(self):
+        queue = mp.Queue()
+        worker = Worker(
+            rank=0,
+            num_workers=1,
+            msg_queue=queue,
+            progress_report_interval=0.0,
+            worker_init=MagicMock(),
+            worker_finalize=MagicMock(),
+        )
+        yield worker
+        queue.close()
+
+    def test_omits_a_finalizer_the_worker_already_has(self, worker):
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+
+        assert sent[0].data_finalizer is not None
+        assert sent[1].data_finalizer is None
+
+    def test_resends_when_the_finalizer_changes(self, worker):
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+            worker.send_ctx(
+                _standalone_ctx(finalizer=_another_finalizer, batch_size=8), blocking=False
+            )
+
+        assert sent[1].data_finalizer is not None
+
+    def test_resends_when_only_the_batch_size_changes(self, worker):
+        # `apply_ctx` applies the batch size and formatting only alongside a non-None
+        # finalizer, so dropping the finalizer would silently drop these with it - which
+        # is exactly what separates a producer's context from a standalone's.
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=64), blocking=False)
+
+        assert sent[1].data_finalizer is not None
+        assert sent[1].data_finalizer_batch_size == 64
+
+
 class TestConsumerShutdown:
     """Consumers are told the data ran out instead of inferring it from a timeout."""
 
@@ -583,3 +641,71 @@ class TestCountedQueue:
         with pytest.raises(Full):
             queue.put("b", timeout=0.1)
         assert queue.get(timeout=5) == "a"
+
+
+class TestInheritedTransformSurvivesRoleSwitches:
+    """A role switch must not cost the forked transform its place."""
+
+    def _worker(self, base_ctx):
+        queue = mp.Queue()
+        return queue, Worker(
+            rank=0,
+            num_workers=1,
+            msg_queue=queue,
+            progress_report_interval=0.0,
+            worker_init=MagicMock(),
+            worker_finalize=MagicMock(),
+            base_ctx=base_ctx,
+            queue_stream="QUEUE_STREAM",
+            queue_put="QUEUE_PUT",
+        )
+
+    def test_switching_back_names_the_transform_instead_of_resending_it(self):
+        # A producer context carries a *different* transform, which displaces what the
+        # worker was using. Without naming the forked one, every switch back re-sent it -
+        # measured at 8.5 MB per consumer context, 272 MB over a 32-worker run.
+        base = _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8)
+        queue, worker = self._worker(base)
+        try:
+            sent = []
+            with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+                worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
+                worker.send_ctx(_standalone_ctx(transform=_another_transform), blocking=False)
+                worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
+        finally:
+            queue.close()
+
+        assert sent[0].data_transform is None, "already held from fork"
+        assert sent[1].data_transform is not None, "a genuinely different transform"
+        assert sent[2].data_transform is INHERITED_TRANSFORM, "named, not shipped again"
+
+    def test_the_worker_resolves_the_name_back_to_the_forked_transform(self):
+        base = _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8)
+        queue, worker = self._worker(base)
+        try:
+            worker.send_ctx(_standalone_ctx(transform=_another_transform), blocking=False)
+            worker._recv_ctx(blocking=True, timeout=5.0)
+            worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
+            received = worker._recv_ctx(blocking=True, timeout=5.0)
+        finally:
+            queue.close()
+
+        assert received.data_transform is _a_transform
+
+    def test_a_named_finalizer_restores_its_batch_size_and_formatting(self):
+        # `apply_ctx` only applies those two alongside a non-None finalizer, so resolving
+        # the name has to bring them back with it.
+        base = _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8)
+        queue, worker = self._worker(base)
+        try:
+            worker.send_ctx(
+                _standalone_ctx(finalizer=_another_finalizer, batch_size=64), blocking=False
+            )
+            worker._recv_ctx(blocking=True, timeout=5.0)
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+            received = worker._recv_ctx(blocking=True, timeout=5.0)
+        finally:
+            queue.close()
+
+        assert received.data_finalizer is _a_finalizer
+        assert received.data_finalizer_batch_size == 8

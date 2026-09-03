@@ -227,6 +227,12 @@ INHERITED_QUEUE_STREAM = _Inherited("queue stream")
 INHERITED_QUEUE_PUT = _Inherited("queue put")
 """Stands in for the shared queue's `put` in a producer context."""
 
+INHERITED_TRANSFORM = _Inherited("transform")
+"""Stands in for the transform the worker was forked with."""
+
+INHERITED_FINALIZER = _Inherited("finalizer")
+"""Stands in for the finalizer the worker was forked with, and how to call it."""
+
 
 @dataclass
 class _PrePickled:
@@ -470,6 +476,11 @@ class Worker(mp.Process):
         # pipe cost a serialisation per worker plus a deserialisation on the critical
         # path before that worker could touch its first shard.
         self._ctx = base_ctx if base_ctx is not None else WorkerContext()
+        # Kept separately and never mutated. `_ctx` is overwritten as roles change - a
+        # producer carries a different transform - and without a pristine copy the
+        # controller has to re-send the original every time a worker switches back. That
+        # was measured at 8.5 MB per consumer context, 272 MB across a 32-worker run.
+        self._base_ctx = replace(base_ctx) if base_ctx is not None else None
         self._queue_stream = queue_stream
         self._queue_put = queue_put
         # What this worker was last known to have *received*. Contexts are sent once per
@@ -578,13 +589,20 @@ class Worker(mp.Process):
             tuple[WorkerContext, None | Callable, None | tuple]: the context to send,
             and the transform and finalizer set the worker will hold once it arrives.
         """
+        base = self._base_ctx
         transform = self._last_transform
         finalizer = self._last_finalizer
-        dropped: dict[str, None] = {}
+        changes: dict[str, Any] = {}
 
         if ctx.data_transform is not None:
             if ctx.data_transform is self._last_transform:
-                dropped["data_transform"] = None
+                changes["data_transform"] = None
+            elif base is not None and ctx.data_transform is base.data_transform:
+                # The worker still has this from `fork`, even though a role switch has
+                # since overwritten what it is currently using. Name it instead of
+                # shipping it again.
+                changes["data_transform"] = INHERITED_TRANSFORM
+                transform = base.data_transform
             else:
                 transform = ctx.data_transform
 
@@ -594,18 +612,32 @@ class Worker(mp.Process):
                 ctx.data_finalizer_batch_size,
                 ctx.data_finalizer_formatting,
             )
-            held = self._last_finalizer
-            if (
-                held is not None
-                and candidate[0] is held[0]
-                and candidate[1] == held[1]
-                and candidate[2] == held[2]
+            if self._matches(candidate, self._last_finalizer):
+                changes["data_finalizer"] = None
+            elif base is not None and self._matches(
+                candidate,
+                (base.data_finalizer, base.data_finalizer_batch_size, base.data_finalizer_formatting),
             ):
-                dropped["data_finalizer"] = None
+                changes["data_finalizer"] = INHERITED_FINALIZER
+                finalizer = candidate
             else:
                 finalizer = candidate
 
-        return (replace(ctx, **dropped) if dropped else ctx), transform, finalizer
+        return (replace(ctx, **changes) if changes else ctx), transform, finalizer
+
+    @staticmethod
+    def _matches(candidate: tuple, held: None | tuple) -> bool:
+        """Whether a finalizer, its batch size and its formatting are all unchanged.
+
+        `apply_ctx` only applies the batch size and formatting alongside a non-None
+        finalizer, so all three have to match before the finalizer can be left out.
+        """
+        return (
+            held is not None
+            and candidate[0] is held[0]
+            and candidate[1] == held[1]
+            and candidate[2] == held[2]
+        )
 
     def _prepickle_parts(self, ctx: WorkerContext) -> WorkerContext:
         """Swap the heavy callables for buffers the cache has already serialised.
@@ -621,7 +653,7 @@ class Worker(mp.Process):
                 ("data_transform", ctx.data_transform),
                 ("data_finalizer", ctx.data_finalizer),
             )
-            if value is not None
+            if value is not None and not isinstance(value, _Inherited)
         }
         return replace(ctx, **prepickled) if prepickled else ctx
 
@@ -739,11 +771,17 @@ class Worker(mp.Process):
         The shared queue cannot cross a pipe, so a context refers to it by name and the
         worker substitutes its own forked copy here.
         """
-        changes = {}
+        changes: dict[str, Any] = {}
         if ctx.data_stream is INHERITED_QUEUE_STREAM:
             changes["data_stream"] = self._queue_stream
+        if ctx.data_transform is INHERITED_TRANSFORM:
+            changes["data_transform"] = self._base_ctx.data_transform
         if ctx.data_finalizer is INHERITED_QUEUE_PUT:
             changes["data_finalizer"] = self._queue_put
+        elif ctx.data_finalizer is INHERITED_FINALIZER:
+            changes["data_finalizer"] = self._base_ctx.data_finalizer
+            changes["data_finalizer_batch_size"] = self._base_ctx.data_finalizer_batch_size
+            changes["data_finalizer_formatting"] = self._base_ctx.data_finalizer_formatting
         return replace(ctx, **changes) if changes else ctx
 
     def _apply_ctx(self, ctx: WorkerContext) -> bool:
