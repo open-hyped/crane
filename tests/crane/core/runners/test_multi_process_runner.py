@@ -13,19 +13,44 @@ from datasets.iterable_dataset import SelectColumnsIterable
 from crane.core.callbacks.base import CallbackManager
 from crane.core.runners.base import WorkerProcessingStage, WorkerRole
 from crane.core.runners.multi_process_runner import (
-    INHERITED_TRANSFORM,
+    Command,
+    CommandType,
     ConsumerProducerBalancer,
     DynamicMultiprocessingRunner,
     MessageType,
+    Source,
     Worker,
     WorkerContext,
     WorkerController,
-    _ContextPartCache,
+    WorkerSetup,
     _CountedQueue,
-    _PrePickled,
-    _unwrap_parts,
 )
 from tests.third_party.sharedmock.mock import SharedMock
+
+
+def _assign_shard(shard_id: int = 0) -> Command:
+    return Command(CommandType.ASSIGN, role=WorkerRole.STANDALONE, shard_id=shard_id)
+
+
+def _message_types(msg_queue) -> list[int]:
+    """Drain whatever the worker has reported so far."""
+    types = []
+    while True:
+        try:
+            types.append(json.loads(msg_queue.get(timeout=0.5).decode("utf-8"))["type"])
+        except Exception:
+            return types
+
+
+def _setup(transform, finalizer, data_source=None, num_shards=1):
+    return WorkerSetup(
+        transform=transform,
+        finalizer=finalizer,
+        finalizer_batch_size=None,
+        finalizer_formatting=None,
+        data_source=data_source,
+        num_shards=num_shards,
+    )
 
 
 class TestWorker:
@@ -48,28 +73,24 @@ class TestWorker:
         return MagicMock(side_effect=lambda x: x)
 
     @pytest.fixture
-    def data_stream(self):
+    def finalizer(self):
+        return MagicMock(return_value=None)
+
+    @pytest.fixture
+    def dataset(self):
         dummy_data = [
             {"a": 0, "b": [1, 2, 3, 4]},
             {"a": 1, "b": [5, 6]},
             {"a": 1, "b": [7, 8, 9, 10]},
         ]
-        ds = Dataset.from_list(dummy_data)
-        ds = ds.to_iterable_dataset(3)
-        return ds._ex_iterable
+        return Dataset.from_list(dummy_data).to_iterable_dataset(1)
 
     @pytest.fixture
-    def context(self, data_stream, transform):
-        return WorkerContext(
-            role=WorkerRole.STANDALONE,
-            data_stream=data_stream,
-            data_transform=transform,
-            data_finalizer=MagicMock(return_value=None),
-            stop=False,
-        )
+    def data_stream(self, dataset):
+        return dataset._ex_iterable
 
     @pytest.fixture
-    def worker(self, msg_queue, worker_init, worker_finalizer, context):
+    def worker(self, msg_queue, worker_init, worker_finalizer, transform, finalizer, data_stream):
         worker = Worker(
             rank=0,
             num_workers=1,
@@ -77,51 +98,85 @@ class TestWorker:
             progress_report_interval=0.0,
             worker_init=worker_init,
             worker_finalize=worker_finalizer,
+            setup=_setup(transform, finalizer, data_source=data_stream),
         )
-        worker._ctx = context
+        worker._build_contexts()
         return worker
 
-    def test_request_new_ctx(self, msg_queue, worker):
-        ctx = WorkerContext(
-            role=WorkerRole.STANDALONE,
-            data_stream="STREAM",
-            data_transform="TRANSFORM",
-            data_finalizer="FINALIZE",
-            stop=False,
-        )
-        # mock context conn receiver to avoid deadlock
-        worker._recv_ctx_resp_conn.recv = MagicMock()
-        # send new context before worker request to avoid deadlock in worker
-        worker.send_ctx(ctx)
-        worker._recv_ctx_resp_conn.recv.assert_called_once()
+    @pytest.fixture
+    def busy_worker(self, worker, data_stream):
+        """A worker part-way through a stream, as far as command acceptance is concerned."""
+        worker._accept(_assign_shard(), busy=False)
+        return worker
 
-        # request new context
-        worker._request_new_ctx()
+    def test_builds_one_context_per_role(self, worker, transform, finalizer):
+        assert worker._standalone_ctx.role is WorkerRole.STANDALONE
+        assert worker._consumer_ctx.role is WorkerRole.CONSUMER
+        assert worker._producer_ctx.role is WorkerRole.PRODUCER
 
-        # make sure the worker send a request context message
-        msg_bytes = msg_queue.get(timeout=1.0)
-        msg = json.loads(msg_bytes.decode("utf-8"))
+        # standalone and consumer run the same pipeline, and differ in where they read
+        assert worker._standalone_ctx.transform is transform
+        assert worker._consumer_ctx.transform is transform
+        assert worker._standalone_ctx.source is Source.SHARD
+        assert worker._consumer_ctx.source is Source.QUEUE
+        # a producer keeps whatever stream it was promoted from
+        assert worker._producer_ctx.source is Source.CURRENT
+
+    def test_request_work_applies_an_assign(self, msg_queue, worker):
+        worker._recv_resp_conn.recv = MagicMock()
+        worker.send_command(_assign_shard())
+
+        worker._request_work()
+
+        msg = json.loads(msg_queue.get(timeout=1.0).decode("utf-8"))
         assert msg["rank"] == worker._rank
         assert msg["type"] == MessageType.CTX_REQUEST.value
+        assert worker._active_ctx is worker._standalone_ctx
+        assert worker._stream is not None
 
-        # check if new context was applied
-        assert worker._ctx == ctx
+    def test_an_idle_worker_refuses_a_switch(self, worker):
+        # A switch keeps the stream the worker is working through; an idle worker has
+        # none, so refusing tells the controller to try another rank.
+        assert not worker._accept(Command(CommandType.SWITCH, role=WorkerRole.PRODUCER), busy=False)
+        assert worker._active_ctx is None
 
-    def test_send_ctx_survives_full_queue(self, worker):
-        # A multiprocessing queue is fed by a background thread, so an item can land in
-        # the slot between the drain and the put. That used to raise `Full` out of
-        # `send_ctx` and kill the controller's message loop, leaving workers waiting for
-        # a context that never arrived - the run then hung instead of finishing.
-        ctx = WorkerContext(
-            role=WorkerRole.STANDALONE,
-            data_stream="STREAM",
-            data_transform="TRANSFORM",
-            data_finalizer="FINALIZE",
-            stop=False,
+    def test_a_busy_worker_refuses_an_assign(self, busy_worker):
+        # An assign brings a new stream, which would discard the one in progress.
+        assert not busy_worker._accept(_assign_shard(), busy=True)
+        assert busy_worker._active_ctx is busy_worker._standalone_ctx
+
+    def test_a_switch_keeps_the_stream(self, busy_worker):
+        stream = busy_worker._stream
+
+        assert busy_worker._accept(Command(CommandType.SWITCH, role=WorkerRole.PRODUCER), busy=True)
+
+        assert busy_worker._active_ctx is busy_worker._producer_ctx
+        assert busy_worker._stream is stream, "a producer carries on with its own shard"
+
+    def test_a_demoted_producer_resumes_its_shard(self, busy_worker):
+        busy_worker._accept(Command(CommandType.SWITCH, role=WorkerRole.PRODUCER), busy=True)
+        stream = busy_worker._stream
+
+        assert busy_worker._accept(
+            Command(CommandType.SWITCH, role=WorkerRole.STANDALONE), busy=True
         )
-        worker._recv_ctx_resp_conn.recv = MagicMock()
 
-        real_put_nowait = worker._ctx_queue.put_nowait
+        assert busy_worker._active_ctx is busy_worker._standalone_ctx
+        assert busy_worker._stream is stream
+
+    def test_stop_is_accepted_in_any_state(self, worker, busy_worker):
+        assert worker._accept(Command(CommandType.STOP), busy=False)
+        assert worker._stop
+
+    def test_send_command_survives_full_queue(self, worker):
+        # A multiprocessing queue is fed by a background thread, so an item can land in
+        # the slot between the drain and the put. That used to raise `Full` out of the
+        # send and kill the controller's message loop, leaving workers waiting for a
+        # command that never arrived - the run then hung instead of finishing.
+        command = _assign_shard()
+        worker._recv_resp_conn.recv = MagicMock()
+
+        real_put_nowait = worker._command_queue.put_nowait
         calls = []
 
         def flaky_put_nowait(item):
@@ -130,86 +185,74 @@ class TestWorker:
                 raise Full()
             real_put_nowait(item)
 
-        worker._ctx_queue.put_nowait = flaky_put_nowait
-        worker.send_ctx(ctx)
+        worker._command_queue.put_nowait = flaky_put_nowait
+        worker.send_command(command)
 
         assert len(calls) == 2, "should have retried after the queue reported itself full"
-        # Heavy parts travel pre-serialised; `_recv_ctx` restores them, so the context
-        # the worker ends up with is what has to match.
-        assert _unwrap_parts(dill.loads(worker._ctx_queue.get(timeout=1.0))) == ctx
+        assert worker._command_queue.get(timeout=1.0) == command
 
-    def test_send_ctx_gives_up_without_raising(self, worker):
+    def test_send_command_gives_up_without_raising(self, worker):
         # A worker that never drains its queue must not take the controller down with it.
-        ctx = WorkerContext(
-            role=WorkerRole.STANDALONE,
-            data_stream="STREAM",
-            data_transform="TRANSFORM",
-            data_finalizer="FINALIZE",
-            stop=False,
-        )
-        worker._recv_ctx_resp_conn.recv = MagicMock()
-        worker._ctx_queue.put_nowait = MagicMock(side_effect=Full())
+        worker._recv_resp_conn.recv = MagicMock()
+        worker._command_queue.put_nowait = MagicMock(side_effect=Full())
 
-        worker.send_ctx(ctx)  # must return rather than raise
+        worker.send_command(_assign_shard())  # must return rather than raise
 
-        assert worker._ctx_queue.put_nowait.call_count > 1
+        assert worker._command_queue.put_nowait.call_count > 1
 
     @patch("crane.core.runners.multi_process_runner.set_worker_info")
-    def test_run(self, mock_set_worker_info, worker, data_stream, transform):
-        # mock request new context
-        worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
-        # run worker
+    def test_run(self, mock_set_worker_info, worker, data_stream, transform, finalizer):
+        worker._request_work = MagicMock(side_effect=[True, False].pop)
+        worker._accept(_assign_shard(), busy=False)
+
         worker.run()
 
         mock_set_worker_info.assert_called_once()
-        # make sure all samples have been processed
         transform.assert_called_once()
-        worker._ctx.data_finalizer.assert_has_calls(
-            [call(x) for _, x in data_stream], any_order=True
-        )
+        finalizer.assert_has_calls([call(x) for _, x in data_stream], any_order=True)
         worker._worker_init.assert_called_once()
         worker._worker_finalize.assert_called_once()
 
     @patch("crane.core.runners.multi_process_runner.set_worker_info")
-    def test_run_with_ctx_update(self, mock_set_worker_info, worker, data_stream, transform):
-        # mock request new and check context
-        worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
-        # mock context connection
-        worker._recv_ctx_resp_conn = MagicMock()
-        worker._recv_ctx_resp_conn.poll = MagicMock(return_value=True)
-        # mock receive context function
-        ctx_update = WorkerContext(role=WorkerRole.STANDALONE, stop=False)
-        worker._recv_ctx = MagicMock(return_value=ctx_update)
+    def test_run_with_role_switch(
+        self, mock_set_worker_info, msg_queue, worker, data_stream, transform
+    ):
+        worker._request_work = MagicMock(side_effect=[True, False].pop)
+        worker._accept(_assign_shard(), busy=False)
+        # Both ends, or replacing only the reader drops the last reference to it, the
+        # pipe is collected, and the worker's reply raises BrokenPipeError. The handshake
+        # is not what this test is about.
+        worker._recv_resp_conn = MagicMock()
+        worker._recv_resp_conn.poll = MagicMock(return_value=True)
+        worker._send_resp_conn = MagicMock()
+        worker._recv_command = MagicMock(
+            return_value=Command(CommandType.SWITCH, role=WorkerRole.STANDALONE)
+        )
 
         worker.run()
 
         mock_set_worker_info.assert_called_once()
-        # make sure all samples have been processed
         transform.assert_called()
-        assert len(worker._recv_ctx.mock_calls) == 3
-        worker._ctx.data_finalizer.assert_has_calls(
-            [call(x) for _, x in data_stream], any_order=True
-        )
+        # What matters is that the switch was taken and announced, not how many times the
+        # loop happened to poll for one.
+        assert worker._recv_command.called
+        assert worker._active_ctx is worker._standalone_ctx
+        assert MessageType.CTX_SWITCH.value in _message_types(msg_queue)
         worker._worker_init.assert_called_once()
         worker._worker_finalize.assert_called_once()
 
     @patch("crane.core.runners.multi_process_runner.set_worker_info")
-    def test_run_with_abort(self, mock_set_worker_info, worker, data_stream, transform):
-        # mock request new and check context
-        worker._request_new_ctx = MagicMock(side_effect=[True, False].pop)
-        # mock receive context function
-        ctx_update = WorkerContext(role=WorkerRole.STANDALONE, stop=True)
-        worker._recv_ctx = MagicMock(return_value=ctx_update)
+    def test_run_with_abort(self, mock_set_worker_info, worker, transform, finalizer):
+        worker._request_work = MagicMock(side_effect=[True, False].pop)
+        worker._accept(_assign_shard(), busy=False)
+        worker._recv_command = MagicMock(return_value=Command(CommandType.STOP))
 
         worker.run()
 
         transform.assert_called_once()
         mock_set_worker_info.assert_called_once()
-        # make sure all samples have been processed
-        assert len(worker._recv_ctx.mock_calls) == 1
-        worker._ctx.data_finalizer.assert_has_calls(
-            [call({"a": 0, "b": [1, 2, 3, 4]})], any_order=True
-        )
+        assert len(worker._recv_command.mock_calls) == 1
+        finalizer.assert_has_calls([call({"a": 0, "b": [1, 2, 3, 4]})], any_order=True)
 
 
 class TestConsumerProducerBalancer(object):
@@ -428,147 +471,6 @@ class TestDynamicMultiprocessingRunner:
         assert actual == expected
 
 
-def _a_transform(ex_iterable):
-    return ex_iterable
-
-
-def _another_transform(ex_iterable):
-    return ex_iterable
-
-
-def _standalone_ctx(transform=None, finalizer=None, batch_size=None, formatting=None):
-    return WorkerContext(
-        role=WorkerRole.STANDALONE,
-        data_stream="STREAM",
-        data_transform=transform,
-        data_finalizer=finalizer,
-        data_finalizer_batch_size=batch_size,
-        data_finalizer_formatting=formatting,
-    )
-
-
-def _capture_sent(store):
-    """Record what went on the wire, with pre-pickled parts left as they were sent."""
-
-    def capture(ctx_bytes, **kwargs):
-        store.append(dill.loads(ctx_bytes))
-        return True
-
-    return capture
-
-
-class TestWorkerContextReuse:
-    """A worker is told its transform once, not once per shard."""
-
-    @pytest.fixture
-    def worker(self):
-        queue = mp.Queue()
-        worker = Worker(
-            rank=0,
-            num_workers=1,
-            msg_queue=queue,
-            progress_report_interval=0.0,
-            worker_init=MagicMock(),
-            worker_finalize=MagicMock(),
-        )
-        yield worker
-        queue.close()
-
-    def test_omits_a_transform_the_worker_already_has(self, worker):
-        # The transform closes over the workload - a tokenizer, in the case that
-        # motivated this - and re-pickling it on every shard assignment made the
-        # single-threaded controller the bottleneck. `apply_ctx` keeps the previous
-        # value for any field arriving as None, so leaving it out is equivalent.
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
-            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
-
-        assert sent[0].data_transform is not None
-        assert sent[1].data_transform is None
-
-    def test_sends_a_transform_that_actually_changed(self, worker):
-        # A producer context carries a different transform, so the check has to be by
-        # identity rather than a blanket blanking of every repeat context.
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
-            worker.send_ctx(_standalone_ctx(_another_transform), blocking=False)
-
-        assert sent[0].data_transform is not None
-        assert sent[1].data_transform is not None
-
-    def test_resends_a_transform_whose_context_was_dropped(self, worker):
-        # A dropped context never reached the worker, so it does not hold that transform
-        # and the next context must still carry it - otherwise it is left with no
-        # pipeline at all.
-        with patch.object(worker, "_send_ctx_bytes", return_value=False):
-            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
-
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(_a_transform), blocking=False)
-
-        assert sent[0].data_transform is not None
-
-
-def _a_finalizer(batch):
-    return None
-
-
-def _another_finalizer(batch):
-    return None
-
-
-class TestFinalizerReuse:
-    """The finalizer is re-sent only when it, or how it is called, actually changes."""
-
-    @pytest.fixture
-    def worker(self):
-        queue = mp.Queue()
-        worker = Worker(
-            rank=0,
-            num_workers=1,
-            msg_queue=queue,
-            progress_report_interval=0.0,
-            worker_init=MagicMock(),
-            worker_finalize=MagicMock(),
-        )
-        yield worker
-        queue.close()
-
-    def test_omits_a_finalizer_the_worker_already_has(self, worker):
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-
-        assert sent[0].data_finalizer is not None
-        assert sent[1].data_finalizer is None
-
-    def test_resends_when_the_finalizer_changes(self, worker):
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-            worker.send_ctx(
-                _standalone_ctx(finalizer=_another_finalizer, batch_size=8), blocking=False
-            )
-
-        assert sent[1].data_finalizer is not None
-
-    def test_resends_when_only_the_batch_size_changes(self, worker):
-        # `apply_ctx` applies the batch size and formatting only alongside a non-None
-        # finalizer, so dropping the finalizer would silently drop these with it - which
-        # is exactly what separates a producer's context from a standalone's.
-        sent = []
-        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=64), blocking=False)
-
-        assert sent[1].data_finalizer is not None
-        assert sent[1].data_finalizer_batch_size == 64
-
-
 class TestConsumerShutdown:
     """Consumers are told the data ran out instead of inferring it from a timeout."""
 
@@ -641,71 +543,3 @@ class TestCountedQueue:
         with pytest.raises(Full):
             queue.put("b", timeout=0.1)
         assert queue.get(timeout=5) == "a"
-
-
-class TestInheritedTransformSurvivesRoleSwitches:
-    """A role switch must not cost the forked transform its place."""
-
-    def _worker(self, base_ctx):
-        queue = mp.Queue()
-        return queue, Worker(
-            rank=0,
-            num_workers=1,
-            msg_queue=queue,
-            progress_report_interval=0.0,
-            worker_init=MagicMock(),
-            worker_finalize=MagicMock(),
-            base_ctx=base_ctx,
-            queue_stream="QUEUE_STREAM",
-            queue_put="QUEUE_PUT",
-        )
-
-    def test_switching_back_names_the_transform_instead_of_resending_it(self):
-        # A producer context carries a *different* transform, which displaces what the
-        # worker was using. Without naming the forked one, every switch back re-sent it -
-        # measured at 8.5 MB per consumer context, 272 MB over a 32-worker run.
-        base = _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8)
-        queue, worker = self._worker(base)
-        try:
-            sent = []
-            with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
-                worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
-                worker.send_ctx(_standalone_ctx(transform=_another_transform), blocking=False)
-                worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
-        finally:
-            queue.close()
-
-        assert sent[0].data_transform is None, "already held from fork"
-        assert sent[1].data_transform is not None, "a genuinely different transform"
-        assert sent[2].data_transform is INHERITED_TRANSFORM, "named, not shipped again"
-
-    def test_the_worker_resolves_the_name_back_to_the_forked_transform(self):
-        base = _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8)
-        queue, worker = self._worker(base)
-        try:
-            worker.send_ctx(_standalone_ctx(transform=_another_transform), blocking=False)
-            worker._recv_ctx(blocking=True, timeout=5.0)
-            worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
-            received = worker._recv_ctx(blocking=True, timeout=5.0)
-        finally:
-            queue.close()
-
-        assert received.data_transform is _a_transform
-
-    def test_a_named_finalizer_restores_its_batch_size_and_formatting(self):
-        # `apply_ctx` only applies those two alongside a non-None finalizer, so resolving
-        # the name has to bring them back with it.
-        base = _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8)
-        queue, worker = self._worker(base)
-        try:
-            worker.send_ctx(
-                _standalone_ctx(finalizer=_another_finalizer, batch_size=64), blocking=False
-            )
-            worker._recv_ctx(blocking=True, timeout=5.0)
-            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
-            received = worker._recv_ctx(blocking=True, timeout=5.0)
-        finally:
-            queue.close()
-
-        assert received.data_finalizer is _a_finalizer
-        assert received.data_finalizer_batch_size == 8
