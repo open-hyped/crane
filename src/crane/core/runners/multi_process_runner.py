@@ -23,11 +23,10 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 from queue import Empty, Full
-from typing import Any, Callable, Iterable, TypeAlias
+from typing import Any, Callable, TypeAlias
 
 import dill
 import orjson
-import pyarrow as pa
 from datasets import IterableDataset
 from datasets.iterable_dataset import (
     FilteredExamplesIterable,
@@ -55,12 +54,18 @@ from .base import BaseRunner, WorkerProcessingStage, WorkerRole
 # shorthands and helper type aliases
 Stages: TypeAlias = WorkerProcessingStage
 
-# How long to keep trying to hand a new context to a worker before giving up on that
-# particular context. The race this absorbs is the queue feeder thread being momentarily
-# behind, which resolves in milliseconds, so keep it short: contexts are also sent from
+# How long to keep trying to hand a command to a worker before giving up on that
+# particular command. The race this absorbs is the queue feeder thread being momentarily
+# behind, which resolves in milliseconds, so keep it short: commands are also sent from
 # the balancer's hot path and a long block there would stall coordination.
-_CTX_SEND_TIMEOUT: float = 1.0
-_CTX_SEND_RETRY_INTERVAL: float = 0.01
+_COMMAND_SEND_TIMEOUT: float = 1.0
+_COMMAND_SEND_RETRY_INTERVAL: float = 0.01
+
+# How long a consumer keeps waiting on a queue that is delivering nothing at all. Only a
+# backstop against a lost close signal - a consumer normally leaves the moment the stream
+# is marked closed - so reaching it means something went wrong rather than that the run
+# ended.
+_QUEUE_GET_TIMEOUT: float = 30.0
 
 # The lazy processing steps that `_prepare_dataset` separates from the data source.
 # `FormattedExamplesIterable` was introduced in newer `datasets` releases (it is inserted
@@ -115,69 +120,184 @@ def _is_separable(ex_iterable: _BaseExamplesIterable) -> bool:
     return False
 
 
-@dataclass
+class _CountedQueue:
+    """An `mp.Queue` that can report its own length on every platform.
+
+    The runner used a `mp.Manager().Queue()` from its first commit. That is expensive: a
+    manager queue is a proxy served by a separate process, so every batch of data is
+    pickled, shipped over a socket, held in that process, then pickled again on its way
+    to the consumer - and the progress monitor polls `qsize()` every 10 ms, which on a
+    proxy is another socket round-trip a hundred times a second, competing with the data
+    it is measuring.
+
+    What stood in the way of simply swapping in a plain `mp.Queue` is that the balancer
+    needs the queue's depth, and `mp.Queue.qsize()` is backed by `sem_getvalue()`, which
+    macOS does not implement.
+
+    Counting puts and gets ourselves keeps a plain `mp.Queue` - one pickle, one pipe, no
+    intermediary - and gives an accurate length on macOS too. The count trails reality
+    slightly, since `mp.Queue` hands items to a feeder thread, but it drives an EMA for
+    the producer/consumer balancer, which wants a trend rather than an exact depth.
+
+    Not picklable, by design: like the `mp.Queue` it wraps, it reaches workers through
+    `fork`, never through a pipe.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        self._queue = mp.Queue(maxsize=maxsize)
+        self._size = mp.Value("i", 0)
+
+    def _bump(self, delta: int) -> None:
+        with self._size.get_lock():
+            self._size.value += delta
+
+    def put(self, item: Any, block: bool = True, timeout: None | float = None) -> None:
+        """Put an item on the queue."""
+        self._queue.put(item, block, timeout)
+        self._bump(1)
+
+    def put_nowait(self, item: Any) -> None:
+        """Put an item on the queue without blocking."""
+        self.put(item, block=False)
+
+    def get(self, block: bool = True, timeout: None | float = None) -> Any:
+        """Take an item off the queue."""
+        item = self._queue.get(block, timeout)
+        self._bump(-1)
+        return item
+
+    def get_nowait(self) -> Any:
+        """Take an item off the queue without blocking."""
+        return self.get(block=False)
+
+    def qsize(self) -> int:
+        """Approximate number of items currently queued."""
+        return max(0, self._size.value)
+
+    def empty(self) -> bool:
+        """Whether the queue is currently empty."""
+        return self.qsize() == 0
+
+
+class Source(Enum):
+    """Where a role takes its data from."""
+
+    SHARD = "shard"
+    """A shard of the source dataset, named by the command."""
+
+    QUEUE = "queue"
+    """The queue shared with the producers."""
+
+    CURRENT = "current"
+    """Whatever stream the worker is already holding; a role that never brings its own."""
+
+
+@dataclass(frozen=True)
 class WorkerContext:
-    """Dataclass representing the context passed to workers.
+    """How a worker processes while it holds one role.
 
-    This class defines the context used for setting up a worker's role, data stream,
-    transformation function, finalization function, and a completion flag.
+    Built once per worker, before it starts, and never sent anywhere. A worker holds one
+    of these per role and swaps between them on command, so the only thing that has to
+    travel at runtime is which role to take; see :class:`Command`.
     """
 
-    role: None | WorkerRole = None
-    """The role assigned to the worker (e.g., producer, processor), or None if the role remains
-    unchanged.
-    """
+    role: WorkerRole
+    """The role this context implements."""
 
-    data_stream: None | _BaseExamplesIterable = None
-    """An iterable providing the stream of data items that the worker will process."""
+    transform: Callable[[_BaseExamplesIterable], _BaseExamplesIterable]
+    """Wraps the data stream and applies the workload to it."""
 
-    data_transform: None | Callable[[_BaseExamplesIterable], _BaseExamplesIterable] = None
-    """A function that wraps the data stream and applies workload on each sample, returning an
-    iterable of processed data.
-    """
+    finalizer: Callable[[Any], Any]
+    """Applied to each sample or batch after the transform."""
 
-    data_finalizer: None | Callable[[Any], Any] = None
-    """A function that applies final processing to each transformed data item, or None if no
-    finalization is needed.
-    """
+    finalizer_batch_size: None | int
+    """Batch size for :attr:`finalizer`, or None to pass individual samples."""
 
-    data_finalizer_batch_size: None | int = None
-    """The size of each batch to process for the :code:`data_finalizer` function.
+    finalizer_formatting: None | FormattingConfig
+    """The data format :attr:`finalizer` expects."""
 
-    If None, the :code:`data_finalizer` will receive individual samples.
-    Otherwise, the :code:`data_finalizer` will receive batches of this size.
-    """
-
-    data_finalizer_formatting: None | FormattingConfig = None
-    """The data format expected by the data finalizer."""
-
-    stop: bool = False
-    """A flag indicating whether the worker should stop processing."""
-
-    def apply_ctx(self, other: WorkerContext) -> None:
-        """Applies non-None values of a given context to self.
-
-        Updates the current context's attributes with the values from another WorkerContext.
-        If any of the values in the other context are None, the original value is retained.
-
-        Args:
-            other (WorkerContext): The context from which to update values.
-        """
-        if other.role is not None:
-            self.role = other.role
-        if other.data_stream is not None:
-            self.data_stream = other.data_stream
-        if other.data_transform is not None:
-            self.data_transform = other.data_transform
-        if other.data_finalizer is not None:
-            self.data_finalizer = other.data_finalizer
-            self.data_finalizer_batch_size = other.data_finalizer_batch_size
-            self.data_finalizer_formatting = other.data_finalizer_formatting
-        self.stop = other.stop
+    source: Source
+    """Where this role reads from."""
 
     def __str__(self) -> str:
-        """Returns a string representation of the WorkerContext, including the worker role."""
-        return f"WorkerContext(worker_role={self.role})"
+        """Returns a string representation of the context, including the worker role."""
+        return f"WorkerContext(role={self.role.name}, source={self.source.name})"
+
+
+@dataclass(frozen=True)
+class WorkerSetup:
+    """Everything a worker needs that is fixed for the whole run.
+
+    Handed over once, at construction. Under `fork` the worker inherits it through
+    copy-on-write and nothing is serialised at all; under `spawn` it is dill-pickled once
+    in :meth:`DynamicMultiprocessingRunner.run` and the same bytes go to every worker, so
+    the cost is one dump per run and one load per worker rather than anything per command.
+
+    Dill rather than pickle because a transform is routinely a closure, a lambda or a
+    partial over a local, which the standard pickler cannot take. That is also why the
+    queue is *not* in here: multiprocessing objects reach a worker through process
+    creation, never through a serialised blob, so they are passed to
+    :class:`Worker` separately.
+    """
+
+    transform: Callable[[_BaseExamplesIterable], _BaseExamplesIterable]
+    """The workload, shared by the standalone and consumer roles."""
+
+    finalizer: Callable[[Any], Any]
+    """The write step, shared by the standalone and consumer roles."""
+
+    finalizer_batch_size: None | int
+    """Batch size for :attr:`finalizer`."""
+
+    finalizer_formatting: None | FormattingConfig
+    """The data format :attr:`finalizer` expects."""
+
+    data_source: _BaseExamplesIterable
+    """The dataset the standalone role takes its shards from."""
+
+    num_shards: int
+    """How many shards :attr:`data_source` is divided into."""
+
+
+class CommandType(Enum):
+    """What the controller is telling a worker to do.
+
+    The counterpart of :class:`MessageType`, which travels the other way: workers report,
+    the controller commands.
+    """
+
+    ASSIGN = 1
+    """Take a new stream and start on it. Only an idle worker accepts one."""
+
+    SWITCH = 2
+    """Change role but keep the current stream. Only a busy worker accepts one."""
+
+    STOP = 3
+    """Finish and shut down."""
+
+
+@dataclass(frozen=True)
+class Command:
+    """An instruction from the controller to one worker. The whole wire payload.
+
+    Small enough to travel as a plain object on the command queue, which pickles it with
+    the standard pickler - so, unlike the pipeline it replaces, it cannot drag a closure
+    along by accident.
+    """
+
+    type: CommandType
+    """What to do."""
+
+    role: None | WorkerRole = None
+    """Which of the worker's contexts to make active. None only for :attr:`CommandType.STOP`."""
+
+    shard_id: None | int = None
+    """Which shard to take, for an :attr:`CommandType.ASSIGN` whose role reads shards."""
+
+    def __str__(self) -> str:
+        """Returns a string representation of the command."""
+        role = self.role.name if self.role is not None else "-"
+        return f"Command({self.type.name}, role={role}, shard={self.shard_id})"
 
 
 class MessageType(Enum):
@@ -245,6 +365,10 @@ class Worker(mp.Process):
         progress_report_interval: float,
         worker_init: Callable[[], Any],
         worker_finalize: Callable[[], Any],
+        setup: WorkerSetup | bytes,
+        queue_stream: None | _BaseExamplesIterable = None,
+        queue_put: None | Callable[[Any], None] = None,
+        prefetch: int = 1,
     ) -> None:
         """Initialize a worker process for parallel data processing.
 
@@ -260,6 +384,15 @@ class Worker(mp.Process):
                 state before processing begins.
             worker_finalize (Callable[[], Any]): A callable function to finalize the worker's
                 state after processing is complete.
+            setup (WorkerSetup | bytes): Everything fixed for the run - the workload, the
+                write step and the dataset to take shards from. Passed as an object where
+                the worker inherits memory, or as dill bytes where it does not; see
+                :class:`WorkerSetup`.
+            queue_stream (None | _BaseExamplesIterable): The shared queue, as the consumer
+                role reads it.
+            queue_put (None | Callable[[Any], None]): The shared queue's put, as the
+                producer role writes it.
+            prefetch (int): How many samples a producer batches into one queue item.
         """
         super(Worker, self).__init__(daemon=True)
 
@@ -267,16 +400,29 @@ class Worker(mp.Process):
         self._num_workers = num_workers
         # connections
         self._msg_queue = msg_queue
-        self._ctx_queue = mp.Queue(maxsize=1)
-        self._recv_ctx_resp_conn, self._send_ctx_resp_conn = mp.Pipe(duplex=False)
+        self._command_queue = mp.Queue(maxsize=1)
+        self._recv_resp_conn, self._send_resp_conn = mp.Pipe(duplex=False)
         # rate limit for progress updates
         self._progress_report_interval = progress_report_interval
         # worker initializer and finalizer
         self._worker_init = worker_init
         self._worker_finalize = worker_finalize
-        # the worker context including the pipeline
-        # to be executed by the worker
-        self._ctx = WorkerContext()
+        # Resolved in `run`, in the child, because under `spawn` it arrives as bytes.
+        self._setup = setup
+        self._queue_stream = queue_stream
+        self._queue_put = queue_put
+        self._prefetch = prefetch
+        # One context per role, built in `_build_contexts` once the setup is resolved.
+        # The active one is always one of these three; commands only ever swap between
+        # them, which is why nothing about the pipeline has to be sent.
+        self._standalone_ctx: None | WorkerContext = None
+        self._producer_ctx: None | WorkerContext = None
+        self._consumer_ctx: None | WorkerContext = None
+        self._active_ctx: None | WorkerContext = None
+        # The stream the active context is working through, and whether we were told to
+        # finish. A `SWITCH` keeps the stream; an `ASSIGN` replaces it.
+        self._stream: None | _BaseExamplesIterable = None
+        self._stop = False
 
         # create logger
         self._logger = logging.getLogger(f"{type(self).__module__}.{type(self).__qualname__}")
@@ -286,6 +432,54 @@ class Worker(mp.Process):
             f"Created worker with rank {self._rank} of {self._num_workers} total workers."
         )
 
+    def _build_contexts(self) -> None:
+        """Build one context per role, from the setup and the shared queue.
+
+        The standalone and consumer roles run the same pipeline and differ only in where
+        they read from; they are still built separately, because that is a fact about the
+        current runner rather than a rule, and three named roles read better than a
+        consumer borrowing the standalone's pipeline.
+
+        The producer context is assembled here rather than shipped, because everything in
+        it is either a constant or the shared queue, both of which the worker already has.
+        """
+        if isinstance(self._setup, bytes):
+            self._setup = dill.loads(self._setup)
+
+        setup: WorkerSetup = self._setup
+        self._standalone_ctx = WorkerContext(
+            role=WorkerRole.STANDALONE,
+            transform=setup.transform,
+            finalizer=setup.finalizer,
+            finalizer_batch_size=setup.finalizer_batch_size,
+            finalizer_formatting=setup.finalizer_formatting,
+            source=Source.SHARD,
+        )
+        self._consumer_ctx = WorkerContext(
+            role=WorkerRole.CONSUMER,
+            transform=setup.transform,
+            finalizer=setup.finalizer,
+            finalizer_batch_size=setup.finalizer_batch_size,
+            finalizer_formatting=setup.finalizer_formatting,
+            source=Source.QUEUE,
+        )
+        self._producer_ctx = WorkerContext(
+            role=WorkerRole.PRODUCER,
+            transform=QueueExamplesIterable.prepare_ex_iterable,
+            finalizer=self._queue_put,
+            finalizer_batch_size=self._prefetch,
+            finalizer_formatting=FormattingConfig(format_type="arrow"),
+            source=Source.CURRENT,
+        )
+
+    def _context_for(self, role: WorkerRole) -> WorkerContext:
+        """The context implementing a role."""
+        return {
+            WorkerRole.STANDALONE: self._standalone_ctx,
+            WorkerRole.PRODUCER: self._producer_ctx,
+            WorkerRole.CONSUMER: self._consumer_ctx,
+        }[role]
+
     def close(self) -> None:
         """Close the Process object.
 
@@ -293,48 +487,48 @@ class Worker(mp.Process):
         an error to call this method if the child process is still running.
         """
         # close connections and queues
-        self._recv_ctx_resp_conn.close()
-        self._send_ctx_resp_conn.close()
-        self._ctx_queue.close()
+        self._recv_resp_conn.close()
+        self._send_resp_conn.close()
+        self._command_queue.close()
         # close worker process
         super(Worker, self).close()
 
-    def send_ctx(self, ctx: WorkerContext, blocking: bool = True) -> bool:
-        """Send new processing context to the worker.
+    def send_command(self, command: Command, blocking: bool = True) -> bool:
+        """Send a command to the worker.
 
         Args:
-            ctx (WorkerContext): The context to send to the worker.
-            blocking (bool): Whether to block and wait for acceptance from the worker.
+            command (Command): The command to send.
+            blocking (bool): Whether to block and wait for the worker's answer.
 
         Returns:
-            bool: Boolean indicating whether the worker accepted the new context.
-            If not blocking, it always returns True.
+            bool: Whether the worker accepted the command. Always True when not blocking.
+            A refusal is meaningful: a worker refuses a `SWITCH` while it is idle and an
+            `ASSIGN` while it is busy, which is how the controller learns that a role
+            change did not take and it should try another rank.
         """
         # clear connection buffer
-        while self._recv_ctx_resp_conn.poll():
-            self._recv_ctx_resp_conn.recv()
+        while self._recv_resp_conn.poll():
+            self._recv_resp_conn.recv()
 
-        # serialize and send context
-        ctx_bytes = dill.dumps(ctx)
-        self._send_ctx_bytes(ctx_bytes)
+        self._send_command(command)
 
         if blocking:
             # wait for feedback from worker
-            accepted = self._recv_ctx_resp_conn.recv()
+            accepted = self._recv_resp_conn.recv()
             # log
-            accept_str = "accpeted" if accepted else "refused"
-            self._logger.debug(f"Sent new context to worker {self._rank}, worker {accept_str}.")
+            accept_str = "accepted" if accepted else "refused"
+            self._logger.debug(f"Sent {command} to worker {self._rank}, worker {accept_str}.")
             # return
             return accepted
 
         else:
-            self._logger.debug(f"Sent new context to worker {self._rank} in non-blocking mode.")
+            self._logger.debug(f"Sent {command} to worker {self._rank} in non-blocking mode.")
             return True
 
-    def _send_ctx_bytes(self, ctx_bytes: bytes, timeout: float = _CTX_SEND_TIMEOUT) -> None:
-        """Replace whatever context is queued for the worker with `ctx_bytes`.
+    def _send_command(self, command: Command, timeout: float = _COMMAND_SEND_TIMEOUT) -> bool:
+        """Replace whatever command is queued for the worker with `command`.
 
-        The queue holds at most one pending context, so a stale one is dropped first.
+        The queue holds at most one pending command, so a stale one is dropped first.
         Draining and then calling `put_nowait` is not enough on its own: a
         `multiprocessing.Queue` is fed by a background thread, so a successful `get()`
         does not free the slot synchronously and an item already in flight can arrive
@@ -342,29 +536,32 @@ class Worker(mp.Process):
         the controller's message loop and take it down - leaving the workers waiting for a
         context that never came, so they never joined and the run hung.
 
-        Retry within a deadline instead, and treat exhaustion as a dropped context rather
+        Retry within a deadline instead, and treat exhaustion as a dropped command rather
         than a fatal error: the balancer sends these continuously, so the next one will
         carry the same information.
+
+        Returns:
+            bool: Whether the command reached the worker's queue.
         """
         deadline = time.monotonic() + timeout
         while True:
             try:
-                self._ctx_queue.get_nowait()
+                self._command_queue.get_nowait()
             except Empty:
                 pass
 
             try:
-                self._ctx_queue.put_nowait(ctx_bytes)
-                return
+                self._command_queue.put_nowait(command)
+                return True
             except Full:
                 if time.monotonic() >= deadline:
                     self._logger.warning(
-                        f"Could not hand a new context to worker {self._rank} within "
-                        f"{timeout}s; the worker is not consuming its context queue. "
-                        f"Dropping this context."
+                        f"Could not hand {command} to worker {self._rank} within "
+                        f"{timeout}s; the worker is not consuming its command queue. "
+                        f"Dropping it."
                     )
-                    return
-                time.sleep(_CTX_SEND_RETRY_INTERVAL)
+                    return False
+                time.sleep(_COMMAND_SEND_RETRY_INTERVAL)
 
     def _send_msg(self, msg_type: MessageType, payload: None | Any = None) -> None:
         """Send a message from the worker to the manager process.
@@ -384,80 +581,87 @@ class Worker(mp.Process):
         msg = orjson.dumps(msg)
         self._msg_queue.put(msg)
 
-    def _request_new_ctx(self) -> bool:
-        """Request new processing context from the main process.
+    def _request_work(self) -> bool:
+        """Ask the controller for something to do, and wait until it answers.
 
         Returns:
             bool: Whether the worker has been instructed to stop.
         """
-        # request new context from main process
-        self._logger.debug("Requesting new context from main process.")
+        self._logger.debug("Requesting work from main process.")
         self._send_msg(MessageType.CTX_REQUEST)
 
-        # wait for new context to be received
-        while (ctx := self._recv_ctx(blocking=True, timeout=1.0)) is None:
-            self._logger.debug("Waiting for worker context...")
+        while True:
+            command = self._recv_command(blocking=True, timeout=1.0)
+            if command is None:
+                self._logger.debug("Waiting for a command...")
+                continue
 
-        # requesting a new context must provide a new data stream
-        if (ctx.data_stream is None) and (not ctx.stop):
-            self._send_ctx_resp_conn.send(False)
-            return self._request_new_ctx()
+            if self._accept(command, busy=False):
+                return self._stop
 
-        return self._apply_ctx(ctx)
+            # An idle worker has no stream to keep, so a role switch is meaningless here.
+            # Refusing tells the controller to try another rank; ask again for real work.
+            self._send_resp_conn.send(False)
+            self._send_msg(MessageType.CTX_REQUEST)
 
-    def _recv_ctx(self, blocking: bool, timeout: float = 1.0) -> WorkerContext | None:
-        """Receive a serialized worker context from the internal context queue.
-
-        This method attempts to retrieve a pickled (serialized) worker context object
-        from the internal context queue (:code:`_ctx_queue`). The context is deserialized
-        using :code:`dill` and returned. If no context is available within the specified
-        timeout, the method returns `None`.
-
-        If :code:`keep_producer` is :code:`True`, the current producer is
-        preserved, and only the processing stages are updated.
+    def _recv_command(self, blocking: bool, timeout: float = 1.0) -> Command | None:
+        """Take the next command off the command queue, if there is one.
 
         Args:
-            blocking (bool): Whether to block while waiting for a context.
-            timeout (float, optional): Maximum time to wait for a context if blocking.
-                Defaults to 1.0 seconds.
+            blocking (bool): Whether to block while waiting for a command.
+            timeout (float, optional): Maximum time to wait when blocking. Defaults to
+                1.0 seconds.
 
         Returns:
-            WorkerContext | None: The deserialized worker context if available,
-            otherwise `None`.
+            Command | None: The command, or None if none arrived in time.
         """
         try:
-            ctx_bytes = self._ctx_queue.get(block=blocking, timeout=timeout)
-            ctx = dill.loads(ctx_bytes)
-            self._logger.debug(f"Received {ctx}.")
-            return ctx
+            command = self._command_queue.get(block=blocking, timeout=timeout)
+            self._logger.debug(f"Received {command}.")
+            return command
         except Empty:
-            pass
+            return None
 
-        self._logger.debug("No worker context received.")  # TODO
-        return None
+    def _accept(self, command: Command, busy: bool) -> bool:
+        """Apply a command if it makes sense in the worker's current state.
 
-    def _apply_ctx(self, ctx: WorkerContext) -> bool:
-        """Apply context to the worker.
+        `ASSIGN` brings a new stream, so only an idle worker can take one; `SWITCH` keeps
+        the stream the worker is working through, so only a busy worker can. Rejecting the
+        mismatch is what the controller reads as "that rank was not available".
 
-        This method updates the worker's internal attributes based on the provided context.
-        Each context element (role, producer, processor, finalizer) is conditionally applied,
-        meaning if the element is :code:`None`, the corresponding worker attribute remains
-        unchanged.
-
-        The method also triggers an event to signal that the context has been successfully received
-        and applied. Additionally, it logs the applied role for debugging purposes.
+        Args:
+            command (Command): The command to consider.
+            busy (bool): Whether the worker is part-way through a stream.
 
         Returns:
-            bool: The :code:`done` flag, which indicates if the process using this context should
-            be completed.
+            bool: Whether the command was applied.
         """
-        # apply the context to the worker context
-        self._ctx.apply_ctx(ctx)
-        self._send_ctx_resp_conn.send(True)
-        # log
-        self._logger.debug(f"Applied {self._ctx}")
+        if command.type is CommandType.STOP:
+            self._stop = True
+            self._send_resp_conn.send(True)
+            self._logger.debug("Applied stop command.")
+            return True
 
-        return self._ctx.stop
+        if (command.type is CommandType.ASSIGN) is busy:
+            return False
+
+        self._active_ctx = self._context_for(command.role)
+        if command.type is CommandType.ASSIGN:
+            # Only an assign brings a stream. A switch changes how the worker processes
+            # and leaves `self._stream` alone, which is what lets a producer carry on
+            # with the shard it was promoted from - and lets it resume that same shard if
+            # it is demoted back to standalone, even though the standalone role otherwise
+            # reads shards.
+            if self._active_ctx.source is Source.SHARD:
+                self._stream = self._setup.data_source.shard_data_sources(
+                    self._setup.num_shards, command.shard_id
+                )
+            elif self._active_ctx.source is Source.QUEUE:
+                self._stream = self._queue_stream
+
+        self._send_resp_conn.send(True)
+        self._logger.debug(f"Applied {self._active_ctx}.")
+        return True
 
     def run(self) -> None:
         """Start the worker process.
@@ -475,6 +679,9 @@ class Worker(mp.Process):
         )
 
         try:
+            # Build the role contexts before announcing readiness: under `spawn` this is
+            # where the setup blob is unpickled, and it must happen in the child.
+            self._build_contexts()
             # initialize worker
             self._worker_init()
             self._send_msg(MessageType.READY)
@@ -482,17 +689,17 @@ class Worker(mp.Process):
 
             done = False
             # request a processing context
-            while (not done) and (not self._request_new_ctx()):
+            while (not done) and (not self._request_work()):
                 stream_exhausted = False
                 # create the stoppable data stream iterator here to avoid
                 # resetting it when a new context is received during processing
-                data_stream = TimedExamplesIterable(self._ctx.data_stream, smoothing=0.1)
+                data_stream = TimedExamplesIterable(self._stream, smoothing=0.1)
                 stoppable_stream = StoppableExamplesIterable(data_stream)
 
                 # exhaust producer
                 while not stream_exhausted:
-                    self._send_msg(MessageType.CTX_STARTED, payload=self._ctx.role.value)
-                    self._logger.debug(f"Starting processing of {self._ctx}.")
+                    self._send_msg(MessageType.CTX_STARTED, payload=self._active_ctx.role.value)
+                    self._logger.debug(f"Starting processing of {self._active_ctx}.")
 
                     num_samples = 0
                     last_report = clock()
@@ -501,7 +708,7 @@ class Worker(mp.Process):
 
                     try:
                         # apply the transformation function to the data stream
-                        transformed_stream = self._ctx.data_transform(stoppable_stream)
+                        transformed_stream = self._active_ctx.transform(stoppable_stream)
                         transformed_stream = TimedExamplesIterable(
                             transformed_stream, smoothing=0.1
                         )
@@ -509,12 +716,12 @@ class Worker(mp.Process):
                         work_iterator = (
                             IterableDataset(
                                 ex_iterable=transformed_stream,
-                                formatting=self._ctx.data_finalizer_formatting,
+                                formatting=self._active_ctx.finalizer_formatting,
                             )
                             .map(
-                                lambda data: (self._ctx.data_finalizer(data) or data),
-                                batched=self._ctx.data_finalizer_batch_size is not None,
-                                batch_size=self._ctx.data_finalizer_batch_size,
+                                lambda data: (self._active_ctx.finalizer(data) or data),
+                                batched=self._active_ctx.finalizer_batch_size is not None,
+                                batch_size=self._active_ctx.finalizer_batch_size,
                             )
                             ._ex_iterable
                         )
@@ -531,8 +738,8 @@ class Worker(mp.Process):
                         work_iterator._init_state_dict()
                         # create the python iterable that executes the workload
                         # dynamically use the pyarrow iterable to avoid unnecessary conversion
-                        iter_arrow = (self._ctx.data_finalizer_formatting is not None) and (
-                            self._ctx.data_finalizer_formatting.format_type == "arrow"
+                        iter_arrow = (self._active_ctx.finalizer_formatting is not None) and (
+                            self._active_ctx.finalizer_formatting.format_type == "arrow"
                         )
                         it = work_iterator.iter_arrow() if iter_arrow else iter(work_iterator)
 
@@ -558,20 +765,18 @@ class Worker(mp.Process):
                         for _, data in it:
                             num_samples += data.num_rows if iter_arrow else 1
 
-                            # check if the worker was asked to apply a new context
-                            if (ctx := self._recv_ctx(blocking=False)) is not None:
-                                self._logger.debug("Detected context update request.")
+                            # check whether the controller wants this worker elsewhere
+                            if (command := self._recv_command(blocking=False)) is not None:
+                                self._logger.debug(f"Detected {command}.")
+                                previous_role = self._active_ctx.role
 
-                                if ctx.data_stream is not None:
-                                    # new context not accepted
-                                    self._send_ctx_resp_conn.send(False)
+                                if command.type is CommandType.ASSIGN:
+                                    # busy, so there is a stream to finish first
+                                    self._send_resp_conn.send(False)
 
-                                elif ctx.stop:
-                                    # stop worker
-                                    self._apply_ctx(ctx)
-                                    self._logger.info(
-                                        "Received stop signal from context, stopping."
-                                    )
+                                elif command.type is CommandType.STOP:
+                                    self._accept(command, busy=True)
+                                    self._logger.info("Received stop command, stopping.")
                                     raise StopIteration()
 
                                 else:
@@ -582,13 +787,14 @@ class Worker(mp.Process):
                                         data.num_rows if iter_arrow else 1 for _, data in it
                                     )
 
-                                    # send progress report before switching the context
+                                    # report progress before the role changes, since the
+                                    # switch message names the role being left
                                     _report_progress(clock(), num_samples, last_report)
                                     self._send_msg(
                                         MessageType.CTX_SWITCH,
-                                        payload=(self._ctx.role.value, ctx.role.value),
+                                        payload=(previous_role.value, command.role.value),
                                     )
-                                    self._apply_ctx(ctx)
+                                    self._accept(command, busy=True)
                                     # recreate the work iterable
                                     break
 
@@ -677,20 +883,39 @@ class WorkerController(object):
     state transitions.
     """
 
-    def __init__(self, workers: list[Worker], prefetch: int, num_shards: int) -> None:
+    def __init__(
+        self,
+        workers: list[Worker],
+        prefetch: int,
+        num_shards: int,
+        queue: None | _CountedQueue = None,
+        queue_it: None | QueueExamplesIterable = None,
+        stream_closed: Any = None,
+    ) -> None:
         """Initializes the WorkerController with the provided workers and serializer.
 
         Args:
             workers (list[Worker]): A list of workers to be controlled.
             prefetch (int): The number of samples to prefetch for each worker.
             num_shards (int): The total number of shards to process.
+            queue (None | _CountedQueue): The shared data queue, created before the
+                workers so they inherit it through `fork`. Defaults to a fresh one, which
+                is only useful when there are no real workers to share it with.
+            queue_it (None | QueueExamplesIterable): The consumers' view of that queue.
+            stream_closed (Any): The event marking the queue as finished. Defaults to a
+                fresh one.
         """
         self.prefetch = prefetch
         self.workers = workers
-        self.queue = mp.Manager().Queue(maxsize=self.num_workers)
-        self.queue_it = QueueExamplesIterable(
-            self.queue, sentinel=None, timeout=30.0, num_shards=num_shards
+        self.queue = queue if queue is not None else _CountedQueue(maxsize=self.num_workers)
+        self.queue_it = (
+            queue_it
+            if queue_it is not None
+            else QueueExamplesIterable(
+                self.queue, sentinel=None, timeout=_QUEUE_GET_TIMEOUT, num_shards=num_shards
+            )
         )
+        self.stream_closed = stream_closed if stream_closed is not None else mp.Event()
         self.standalone_ranks = set()
         self.producer_ranks = set()
         self.consumer_ranks = set()
@@ -722,125 +947,91 @@ class WorkerController(object):
 
         self._logger.info("All workers started.")
 
-    def create_standalone_worker(
-        self,
-        rank: int,
-        shard: Iterable[pa.Array],
-        transform: Callable[[Iterable], Iterable] | None,
-        finalizer: Callable[[Any], Any] | None,
-        finalizer_batch_size: int | None,
-        finalizer_formatting: FormattingConfig | None,
-    ) -> None:
-        """Assigns a worker the role of processor and provides the processing context.
+    def assign_shard(self, rank: int, shard_id: int) -> None:
+        """Put a worker to work on a shard, on its own.
 
         Args:
             rank (int): The rank of the worker to assign.
-            shard (Iterable): The data shard to be processed.
-            transform (Callable[[Iterable], Iterable] | None): The transform function.
-            finalizer (Callable[[Any], Any] | None): The finalizer function.
-            finalizer_batch_size (int | None): The finalizer batch size.
-            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
+            shard_id (int): The shard for it to process.
         """
-        ctx = WorkerContext(
-            role=WorkerRole.STANDALONE,
-            data_stream=shard,
-            data_transform=transform,
-            data_finalizer=finalizer,
-            data_finalizer_batch_size=finalizer_batch_size,
-            data_finalizer_formatting=finalizer_formatting,
+        self.workers[rank].send_command(
+            Command(CommandType.ASSIGN, role=WorkerRole.STANDALONE, shard_id=shard_id),
+            blocking=False,
         )
-        self.workers[rank].send_ctx(ctx, blocking=False)
         self.standalone_ranks.add(rank)
-        self._logger.info(f"Assigned worker {rank} as standalone worker.")
+        self._logger.info(f"Assigned shard {shard_id} to worker {rank} as standalone.")
 
-    def create_consumer_worker(
-        self,
-        rank: int,
-        transform: Callable[[Iterable], Iterable] | None,
-        finalizer: Callable[[Any], Any] | None,
-        finalizer_batch_size: int | None,
-        finalizer_formatting: FormattingConfig | None,
-    ) -> None:
-        """Assigns a worker the role of consumer and provides the consumer context.
+    def assign_consumer(self, rank: int) -> None:
+        """Put a worker to work on the shared queue.
 
         Args:
             rank (int): The rank of the worker to assign.
-            transform (Callable[[Iterable], Iterable] | None): The tranform function.
-            finalizer (Callable[[Any], Any] | None): The finalizer function.
-            finalizer_batch_size (int | None): The finalizer batch size.
-            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
         """
-        ctx = WorkerContext(
-            role=WorkerRole.CONSUMER,
-            data_stream=self.queue_it,
-            data_transform=transform,
-            data_finalizer=finalizer,
-            data_finalizer_batch_size=finalizer_batch_size,
-            data_finalizer_formatting=finalizer_formatting,
+        self.workers[rank].send_command(
+            Command(CommandType.ASSIGN, role=WorkerRole.CONSUMER), blocking=False
         )
-        self.workers[rank].send_ctx(ctx, blocking=False)
         self.consumer_ranks.add(rank)
         self._logger.info(f"Assigned worker {rank} as consumer.")
 
     def try_switch_standalone_to_producer(self) -> int | None:
         """Attempts to switch a processor to a producer role.
 
-        If successful, the processor rank is removed from the processor set and added to the
-        producer set.
+        A worker only accepts a switch while it is part-way through a stream, so a refusal
+        means that rank was idle and another should be tried.
 
         Returns:
             int | None: The rank of the worker if the switch is successful, None otherwise.
         """
-        ctx_update = WorkerContext(
-            role=WorkerRole.PRODUCER,
-            data_transform=QueueExamplesIterable.prepare_ex_iterable,
-            data_finalizer=self.queue.put,
-            data_finalizer_batch_size=self.prefetch,
-            data_finalizer_formatting=FormattingConfig(format_type="arrow"),
-        )
+        command = Command(CommandType.SWITCH, role=WorkerRole.PRODUCER)
         for rank in self.standalone_ranks:
-            if self.workers[rank].send_ctx(ctx_update, blocking=True):
+            # A producer keeps the stream it already has, so it must be promoted from a
+            # standalone holding a shard - never from a consumer, which would leave it
+            # reading the queue it is supposed to be filling.
+            if self.workers[rank].send_command(command, blocking=True):
                 self.standalone_ranks.remove(rank)
                 self.producer_ranks.add(rank)
                 self._logger.info(f"Assigned worker {rank} as producer.")
                 return rank
-            self._logger.info(f"Worker {rank} did not accept producer context.")
+            self._logger.info(f"Worker {rank} did not accept producer command.")
 
-    def try_switch_producer_to_standalone(
-        self,
-        transform: Callable[[Iterable], Iterable] | None,
-        finalizer: Callable[[Any], Any] | None,
-        finalizer_batch_size: int | None,
-        finalizer_formatting: FormattingConfig | None,
-    ) -> int | None:
-        """Attempts to switch a producer to a processor role.
+    def try_switch_producer_to_standalone(self) -> int | None:
+        """Attempts to switch a producer back to a processor role.
 
-        If successful, the producer rank is removed from the producer set and added to the
-        processor set.
-
-        Args:
-            transform (Callable[[Iterable], Iterable] | None): The transform function.
-            finalizer (Callable[[Any], Any] | None): The finalizer function.
-            finalizer_batch_size (int | None): The finalizer batch size.
-            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
+        The worker keeps the shard it was producing from and goes back to writing it out
+        itself.
 
         Returns:
             int | None: The rank of the worker if the switch is successful, None otherwise.
         """
-        ctx_update = WorkerContext(
-            role=WorkerRole.STANDALONE,
-            data_transform=transform,
-            data_finalizer=finalizer,
-            data_finalizer_batch_size=finalizer_batch_size,
-            data_finalizer_formatting=finalizer_formatting,
-        )
+        command = Command(CommandType.SWITCH, role=WorkerRole.STANDALONE)
         for rank in self.producer_ranks:
-            if self.workers[rank].send_ctx(ctx_update, blocking=True):
+            if self.workers[rank].send_command(command, blocking=True):
                 self.producer_ranks.remove(rank)
                 self.standalone_ranks.add(rank)
                 self._logger.info(f"Assigned worker {rank} as processor.")
                 return rank
-            self._logger.info(f"Worker {rank} did not accept processor context.")
+            self._logger.info(f"Worker {rank} did not accept processor command.")
+
+    def close_stream(self) -> None:
+        """Mark the shared queue as finished, releasing every consumer waiting on it.
+
+        `QueueExamplesIterable` leaves a drained queue either on this flag or, failing
+        that, once its `get` has come up empty for the whole timeout. Nothing used to set
+        anything, so waiting out 30 s was a consumer's only way to finish - and that is
+        the ordinary end of every run, since once the shard pool empties every worker
+        still alive is made a consumer.
+
+        A flag rather than a sentinel per consumer, because a sentinel is not addressed:
+        any consumer takes any of them, so releasing exactly the set of workers that are
+        waiting means counting recipients correctly through role changes, and retrying
+        posts that a full queue rejected - at a moment when no messages may be arriving to
+        prompt a retry. Setting a flag every consumer can see needs none of that.
+
+        Only safe once no further data can appear; see `_close_stream_if_finished`.
+        """
+        if not self.stream_closed.is_set():
+            self.stream_closed.set()
+            self._logger.debug("Marked the data queue as closed.")
 
     def free_worker(self, rank: int) -> None:
         """Removes the worker from any active roles.
@@ -858,7 +1049,7 @@ class WorkerController(object):
         Args:
             rank (int): The rank of the worker to stop.
         """
-        self.workers[rank].send_ctx(WorkerContext(stop=True), blocking=False)
+        self.workers[rank].send_command(Command(CommandType.STOP), blocking=False)
 
     def stop_all(self) -> None:
         """Sends a stopping signal to all alive workers."""
@@ -1070,11 +1261,6 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
     def _handle_message_loop(
         self,
-        src_ds: IterableDataset,
-        transform: Callable[[_BaseExamplesIterable], _BaseExamplesIterable],
-        finalizer: Callable[[Any], Any],
-        finalizer_batch_size: None | int,
-        finalizer_formatting: None | FormattingConfig,
         msg_queue: mp.Queue,
         monitor: ProgressMonitor,
         controller: WorkerController,
@@ -1084,17 +1270,12 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         This method listens for messages from worker processes via the given connection.
         It processes various types of messages related to worker states, including
-        readiness, completion, context switching, and progress reporting.
+        readiness, completion, role switching, and progress reporting.
+
+        The pipeline itself is not among the arguments: workers were handed it at
+        construction, so the loop only ever tells them which role to take.
 
         Args:
-            src_ds (IterableDataset): The source dataset from which shards are drawn for
-                processing.
-            transform (Callable[[Iterable[T]], Iterable[U]]): A transformation function that
-                processes a shard of data.
-            finalizer (Callable[[Any], Any]): A function that finalizes each sample or batch
-                after it has been transformed.
-            finalizer_batch_size (int | None): The finalizer batch size.
-            finalizer_formatting (FormattingConfig | None): The finalizer formatting config.
             msg_queue (mp.Queue): The queue used to receive messages from worker processes.
             monitor (ProgressMonitor): An object responsible for tracking the progress and state
                 of the workers and the overall processing.
@@ -1110,6 +1291,33 @@ class DynamicMultiprocessingRunner(BaseRunner):
         # used to rate limit the context switches of workers
         switching_worker: None | int = None
         last_switch = clock()
+
+        def _no_more_data() -> bool:
+            """Whether anything could still put data on the shared queue.
+
+            Nothing can once there is no shard waiting to be assigned, no worker
+            producing, and no standalone worker left for
+            `try_switch_standalone_to_producer` to promote into one.
+            """
+            return not (
+                monitor.any_pending_shards
+                or controller.any_producers
+                or controller.standalone_ranks
+            )
+
+        def _close_stream_if_finished() -> None:
+            """Mark the queue closed once the data really has run out.
+
+            A consumer blocked on the shared queue cannot distinguish "empty for now"
+            from "empty for good" - that is what the flag is for.
+
+            Note that this says nothing about what is already *buffered*. Data that has
+            been produced still has to be worked through, and spare workers joining as
+            consumers is what drains it in parallel, so the run is not settled here - the
+            flag only says that nothing further will arrive.
+            """
+            if _no_more_data():
+                controller.close_stream()
 
         done = False
         while not done:
@@ -1130,7 +1338,13 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 controller.join_worker(rank)
                 monitor._mark_worker_done(rank)
                 self._logger.debug(f"Worker {rank} done.")
-                done = not monitor.any_worker_alive
+                # Every worker reports DONE from its `finally`, so counting them is the
+                # one condition that cannot end the loop early. `any_worker_alive` looks
+                # equivalent but is not: a worker is only marked alive once it reports
+                # READY, so a run short enough to finish before a straggler has started
+                # would see "nobody alive" and leave that worker unjoined. That used to
+                # be unreachable only because every run sat out the consumer timeout.
+                done = len(controller.joined_ranks) == controller.num_workers
 
             elif msg_type is MessageType.CTX_STARTED:
                 # update monitor state
@@ -1159,6 +1373,8 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     # run the callback
                     self._callback.on_shard_completed(monitor, shard_id)
 
+                _close_stream_if_finished()
+
             elif msg_type is MessageType.CTX_CANCELED:
                 if monitor.get_worker_role(rank) is WorkerRole.PRODUCER:
                     # try to start another producer shard to replace this one
@@ -1174,6 +1390,8 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 if shard_id is not None:
                     # run the callback
                     self._callback.on_shard_canceled(monitor, shard_id)
+
+                _close_stream_if_finished()
 
             elif msg_type is MessageType.CTX_SWITCH:
                 # parse payload
@@ -1204,12 +1422,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                         len(controller.producer_ranks) > 1
                     ):
                         # try to convert an active producer back to a processor
-                        switching_worker = controller.try_switch_producer_to_standalone(
-                            transform=transform,
-                            finalizer=finalizer,
-                            finalizer_batch_size=finalizer_batch_size,
-                            finalizer_formatting=finalizer_formatting,
-                        )
+                        switching_worker = controller.try_switch_producer_to_standalone()
                         last_switch = now
 
             elif msg_type is MessageType.CTX_REQUEST:
@@ -1224,22 +1437,22 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 elif monitor.any_pending_shards:
                     # Stage 1
                     shard_id = monitor.pending_shards.pop()
-                    # get shard and send processor context to worker
-                    shard = src_ds.shard_data_sources(monitor.num_shards, shard_id)
-                    controller.create_standalone_worker(
-                        rank=rank,
-                        shard=shard,
-                        transform=transform,
-                        finalizer=finalizer,
-                        finalizer_batch_size=finalizer_batch_size,
-                        finalizer_formatting=finalizer_formatting,
-                    )
+                    # The worker derives the shard itself; only its id has to travel.
+                    controller.assign_shard(rank, shard_id)
                     # run callback
                     self._callback.on_shard_in_progress(monitor, shard_id)
 
                     # mark shard as assigned to worker
                     monitor._mark_shard_in_progress(rank, shard_id)
-                    self._logger.info(f"Assigned shard {shard_id} to worker {rank}.")
+
+                elif _no_more_data() and controller.queue.empty():
+                    # Nothing can be produced *and* nothing is left buffered, so a
+                    # consumer here would find the stream already closed and complete
+                    # again immediately. The queue check is the important half: while data
+                    # is still buffered the extra consumers are what drain it in parallel,
+                    # which is the whole point of stage 2.
+                    _close_stream_if_finished()
+                    controller.stop_worker(rank)
 
                 else:
                     # Stage 2
@@ -1249,13 +1462,12 @@ class DynamicMultiprocessingRunner(BaseRunner):
                         controller.try_switch_standalone_to_producer()
 
                     # assign worker as consumer
-                    controller.create_consumer_worker(
-                        rank=rank,
-                        transform=transform,
-                        finalizer=finalizer,
-                        finalizer_batch_size=finalizer_batch_size,
-                        finalizer_formatting=finalizer_formatting,
-                    )
+                    controller.assign_consumer(rank)
+
+                    # A worker joining as a consumer just as the data runs out has to
+                    # find the stream marked closed, or it would sit out the full timeout
+                    # on a queue that will never fill again.
+                    _close_stream_if_finished()
 
                     # evenutally all workers are consumers
                     if monitor.alive_workers == controller.consumer_ranks:
@@ -1291,6 +1503,35 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         # create a worker message queue
         msg_queue = mp.Queue()
+        # Everything below is built *before* the workers, so it reaches them through
+        # process creation rather than through the command queue. The data queue cannot be
+        # pickled through a pipe at all, and the pipeline is the same several-megabyte
+        # object for every worker - neither belongs in a per-command payload.
+        data_queue = _CountedQueue(maxsize=self._num_workers)
+        stream_closed = mp.Event()
+        queue_it = QueueExamplesIterable(
+            data_queue,
+            sentinel=None,
+            timeout=_QUEUE_GET_TIMEOUT,
+            num_shards=num_shards,
+            closed=stream_closed,
+        )
+        setup = WorkerSetup(
+            transform=transform,
+            finalizer=finalizer,
+            finalizer_batch_size=batch_size,
+            finalizer_formatting=(
+                None if formatting is None else FormattingConfig(format_type=formatting)
+            ),
+            data_source=src_ds,
+            num_shards=num_shards,
+        )
+        # Under `fork` the workers inherit the setup through copy-on-write and nothing is
+        # serialised. Otherwise it is dill-pickled once here and the same bytes go to all
+        # of them - one dump per run, one load per worker, and nothing per command. Dill
+        # because a transform is routinely a closure, which the standard pickler that
+        # `spawn` uses for the worker object cannot take.
+        worker_setup = setup if mp.get_start_method() == "fork" else dill.dumps(setup)
         # create all workers
         workers = [
             Worker(
@@ -1300,12 +1541,23 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 progress_report_interval=self._report_interval,
                 worker_init=self._worker_init,
                 worker_finalize=self._worker_finalize,
+                setup=worker_setup,
+                queue_stream=queue_it,
+                queue_put=data_queue.put,
+                prefetch=self._prefetch,
             )
             for rank in range(self._num_workers)
         ]
 
         # create controller
-        controller = WorkerController(workers, self._prefetch, num_shards)
+        controller = WorkerController(
+            workers,
+            self._prefetch,
+            num_shards,
+            queue=data_queue,
+            queue_it=queue_it,
+            stream_closed=stream_closed,
+        )
         controller.start()
 
         # create the progress monitor, note that the serializer dumps a batch of samples
@@ -1319,13 +1571,6 @@ class DynamicMultiprocessingRunner(BaseRunner):
         message_handler = partial(
             self._handle_message_loop,
             msg_queue=msg_queue,
-            src_ds=src_ds,
-            transform=transform,
-            finalizer=finalizer,
-            finalizer_batch_size=batch_size,
-            finalizer_formatting=(
-                None if formatting is None else FormattingConfig(format_type=formatting)
-            ),
             monitor=monitor,
             controller=controller,
             balancer=balancer,
