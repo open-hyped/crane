@@ -68,6 +68,10 @@ _CTX_SEND_RETRY_INTERVAL: float = 0.01
 # gives up after the first failure and retries on its next message instead.
 _SENTINEL_PUT_TIMEOUT: float = 0.5
 
+# How long a consumer waits on a drained queue before giving up on its own. With the
+# end-of-stream sentinel this is only a backstop, never the normal path out.
+_QUEUE_GET_TIMEOUT: float = 30.0
+
 # The lazy processing steps that `_prepare_dataset` separates from the data source.
 # `FormattedExamplesIterable` was introduced in newer `datasets` releases (it is inserted
 # into the iterable chain by `.map`); guard the import so crane keeps working on versions
@@ -119,6 +123,106 @@ def _is_separable(ex_iterable: _BaseExamplesIterable) -> bool:
     if isinstance(ex_iterable, _PROJECTION_EX_ITERABLES):
         return _has_separable_below(ex_iterable)
     return False
+
+
+class _CountedQueue:
+    """An `mp.Queue` that can report its own length on every platform.
+
+    The runner previously used a `mp.Manager().Queue()`, because `mp.Queue.qsize()` is
+    backed by `sem_getvalue()` and macOS does not implement it. That fix was expensive:
+    a manager queue is a proxy served by a separate process, so every batch of data is
+    pickled, shipped over a socket, held in that process, then pickled again on its way
+    to the consumer - and the progress monitor polls `qsize()` every 10 ms, which on a
+    proxy is another socket round-trip a hundred times a second, competing with the data
+    it is measuring.
+
+    Counting puts and gets ourselves keeps a plain `mp.Queue` - one pickle, one pipe, no
+    intermediary - and gives an accurate length on macOS too. The count trails reality
+    slightly, since `mp.Queue` hands items to a feeder thread, but it drives an EMA for
+    the producer/consumer balancer, which wants a trend rather than an exact depth.
+
+    Not picklable, by design: like the `mp.Queue` it wraps, it reaches workers through
+    `fork`, never through a pipe.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        self._queue = mp.Queue(maxsize=maxsize)
+        self._size = mp.Value("i", 0)
+
+    def _bump(self, delta: int) -> None:
+        with self._size.get_lock():
+            self._size.value += delta
+
+    def put(self, item: Any, block: bool = True, timeout: None | float = None) -> None:
+        """Put an item on the queue."""
+        self._queue.put(item, block, timeout)
+        self._bump(1)
+
+    def put_nowait(self, item: Any) -> None:
+        """Put an item on the queue without blocking."""
+        self.put(item, block=False)
+
+    def get(self, block: bool = True, timeout: None | float = None) -> Any:
+        """Take an item off the queue."""
+        item = self._queue.get(block, timeout)
+        self._bump(-1)
+        return item
+
+    def get_nowait(self) -> Any:
+        """Take an item off the queue without blocking."""
+        return self.get(block=False)
+
+    def qsize(self) -> int:
+        """Approximate number of items currently queued."""
+        return max(0, self._size.value)
+
+    def empty(self) -> bool:
+        """Whether the queue is currently empty."""
+        return self.qsize() == 0
+
+
+_INHERITED_MARKERS: dict[str, "_Inherited"] = {}
+
+
+class _Inherited:
+    """Marks a context field the worker already holds, rather than carrying it.
+
+    The shared data queue cannot travel through a pipe - neither an `mp.Queue` nor the
+    iterable wrapping it is picklable - so the context names it and the worker
+    substitutes its own.
+
+    A marker is compared by identity, and a context is pickled on its way to the worker,
+    so unpickling has to yield the *same* object rather than an equal copy. Without that
+    the marker arrives unrecognised and reaches the pipeline as data, where it surfaces
+    as "'_Inherited' object is not callable" from deep inside the map. Interning by name
+    in `__new__`, and pickling back through the constructor, keeps one instance per name
+    in every process.
+    """
+
+    __slots__ = ("name",)
+
+    def __new__(cls, name: str) -> "_Inherited":
+        """Return the one marker with this name, creating it the first time."""
+        marker = _INHERITED_MARKERS.get(name)
+        if marker is None:
+            marker = super().__new__(cls)
+            marker.name = name
+            _INHERITED_MARKERS[name] = marker
+        return marker
+
+    def __reduce__(self):
+        """Pickle back to the interned instance, so identity survives the trip."""
+        return (_Inherited, (self.name,))
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<inherited {self.name}>"
+
+
+INHERITED_QUEUE_STREAM = _Inherited("queue stream")
+"""Stands in for the shared queue's examples iterable in a consumer context."""
+
+INHERITED_QUEUE_PUT = _Inherited("queue put")
+"""Stands in for the shared queue's `put` in a producer context."""
 
 
 @dataclass
@@ -314,6 +418,9 @@ class Worker(mp.Process):
         worker_init: Callable[[], Any],
         worker_finalize: Callable[[], Any],
         ctx_part_cache: None | _ContextPartCache = None,
+        base_ctx: None | WorkerContext = None,
+        queue_stream: None | _BaseExamplesIterable = None,
+        queue_put: None | Callable[[Any], None] = None,
     ) -> None:
         """Initialize a worker process for parallel data processing.
 
@@ -333,6 +440,13 @@ class Worker(mp.Process):
                 parts, shared with the other workers so that a transform every worker
                 receives is pickled once rather than once per worker. Defaults to a
                 private cache.
+            base_ctx (None | WorkerContext): The transform and finalizer this worker will
+                inherit through `fork`, so they never have to be serialised or sent.
+            queue_stream (None | _BaseExamplesIterable): The shared queue's examples
+                iterable, substituted wherever a context names
+                :data:`INHERITED_QUEUE_STREAM`.
+            queue_put (None | Callable[[Any], None]): The shared queue's put, substituted
+                wherever a context names :data:`INHERITED_QUEUE_PUT`.
         """
         super(Worker, self).__init__(daemon=True)
 
@@ -347,14 +461,29 @@ class Worker(mp.Process):
         # worker initializer and finalizer
         self._worker_init = worker_init
         self._worker_finalize = worker_finalize
-        # the worker context including the pipeline
-        # to be executed by the worker
-        self._ctx = WorkerContext()
+        # The pipeline this worker executes. Seeded before `start()` so that `fork`
+        # carries the transform and finalizer into the child: they are identical for
+        # every worker and several megabytes each, and sending them through the context
+        # pipe cost a serialisation per worker plus a deserialisation on the critical
+        # path before that worker could touch its first shard.
+        self._ctx = base_ctx if base_ctx is not None else WorkerContext()
+        self._queue_stream = queue_stream
+        self._queue_put = queue_put
         # What this worker was last known to have *received*. Contexts are sent once per
         # shard assignment but these rarely change, and re-serialising them every time is
         # expensive; see `_strip_parts_already_held`.
-        self._last_transform: None | Callable = None
-        self._last_finalizer: None | tuple = None
+        # Seeded from what `fork` already delivered, so the first context sent to this
+        # worker leaves both out just as every later one does.
+        self._last_transform: None | Callable = self._ctx.data_transform
+        self._last_finalizer: None | tuple = (
+            None
+            if self._ctx.data_finalizer is None
+            else (
+                self._ctx.data_finalizer,
+                self._ctx.data_finalizer_batch_size,
+                self._ctx.data_finalizer_formatting,
+            )
+        )
         # Shared with the other workers so one transform is pickled once for all of them,
         # not once each. A worker given no cache keeps its own, which is still correct.
         self._ctx_part_cache = ctx_part_cache if ctx_part_cache is not None else _ContextPartCache()
@@ -592,7 +721,7 @@ class Worker(mp.Process):
         """
         try:
             ctx_bytes = self._ctx_queue.get(block=blocking, timeout=timeout)
-            ctx = _unwrap_parts(dill.loads(ctx_bytes))
+            ctx = self._resolve_inherited(_unwrap_parts(dill.loads(ctx_bytes)))
             self._logger.debug(f"Received {ctx}.")
             return ctx
         except Empty:
@@ -600,6 +729,19 @@ class Worker(mp.Process):
 
         self._logger.debug("No worker context received.")  # TODO
         return None
+
+    def _resolve_inherited(self, ctx: WorkerContext) -> WorkerContext:
+        """Swap the inheritance markers for the objects this worker already holds.
+
+        The shared queue cannot cross a pipe, so a context refers to it by name and the
+        worker substitutes its own forked copy here.
+        """
+        changes = {}
+        if ctx.data_stream is INHERITED_QUEUE_STREAM:
+            changes["data_stream"] = self._queue_stream
+        if ctx.data_finalizer is INHERITED_QUEUE_PUT:
+            changes["data_finalizer"] = self._queue_put
+        return replace(ctx, **changes) if changes else ctx
 
     def _apply_ctx(self, ctx: WorkerContext) -> bool:
         """Apply context to the worker.
@@ -842,19 +984,33 @@ class WorkerController(object):
     state transitions.
     """
 
-    def __init__(self, workers: list[Worker], prefetch: int, num_shards: int) -> None:
+    def __init__(
+        self,
+        workers: list[Worker],
+        prefetch: int,
+        num_shards: int,
+        queue: None | _CountedQueue = None,
+        queue_it: None | QueueExamplesIterable = None,
+    ) -> None:
         """Initializes the WorkerController with the provided workers and serializer.
 
         Args:
             workers (list[Worker]): A list of workers to be controlled.
             prefetch (int): The number of samples to prefetch for each worker.
             num_shards (int): The total number of shards to process.
+            queue (None | _CountedQueue): The shared data queue, created before the
+                workers so they inherit it through `fork`. Defaults to a fresh one, which
+                is only useful when there are no real workers to share it with.
         """
         self.prefetch = prefetch
         self.workers = workers
-        self.queue = mp.Manager().Queue(maxsize=self.num_workers)
-        self.queue_it = QueueExamplesIterable(
-            self.queue, sentinel=None, timeout=30.0, num_shards=num_shards
+        self.queue = queue if queue is not None else _CountedQueue(maxsize=self.num_workers)
+        self.queue_it = (
+            queue_it
+            if queue_it is not None
+            else QueueExamplesIterable(
+                self.queue, sentinel=None, timeout=_QUEUE_GET_TIMEOUT, num_shards=num_shards
+            )
         )
         self.standalone_ranks = set()
         self.producer_ranks = set()
@@ -942,7 +1098,9 @@ class WorkerController(object):
         """
         ctx = WorkerContext(
             role=WorkerRole.CONSUMER,
-            data_stream=self.queue_it,
+            # Named, not carried: neither the queue nor its iterable can be pickled, and
+            # the worker holds its own from `fork`.
+            data_stream=INHERITED_QUEUE_STREAM,
             data_transform=transform,
             data_finalizer=finalizer,
             data_finalizer_batch_size=finalizer_batch_size,
@@ -964,7 +1122,7 @@ class WorkerController(object):
         ctx_update = WorkerContext(
             role=WorkerRole.PRODUCER,
             data_transform=QueueExamplesIterable.prepare_ex_iterable,
-            data_finalizer=self.queue.put,
+            data_finalizer=INHERITED_QUEUE_PUT,
             data_finalizer_batch_size=self.prefetch,
             data_finalizer_formatting=FormattingConfig(format_type="arrow"),
         )
@@ -1333,19 +1491,32 @@ class DynamicMultiprocessingRunner(BaseRunner):
         switching_worker: None | int = None
         last_switch = clock()
 
+        def _no_more_data() -> bool:
+            """Whether anything could still put data on the shared queue.
+
+            Nothing can once there is no shard waiting to be assigned, no worker
+            producing, and no standalone worker left for
+            `try_switch_standalone_to_producer` to promote into one.
+            """
+            return not (
+                monitor.any_pending_shards
+                or controller.any_producers
+                or controller.standalone_ranks
+            )
+
         def _release_finished_consumers() -> None:
             """Tell the consumers the data has run out, when it actually has.
 
             A consumer blocked on the shared queue cannot distinguish "empty for now"
-            from "empty for good" - that is what the sentinel is for. The condition for
-            posting it is that nothing can produce again: no shard is waiting to be
-            assigned, no worker is producing, and no standalone worker is left that
-            `try_switch_standalone_to_producer` could still promote into one.
+            from "empty for good" - that is what the sentinel is for.
+
+            Note that this says nothing about what is already *buffered*. Data that has
+            been produced still has to be worked through, and spare workers joining as
+            consumers is what drains it in parallel, so the run is not settled here.
             """
-            if monitor.any_pending_shards:
+            if not _no_more_data():
                 return
-            if controller.any_producers or controller.standalone_ranks:
-                return
+
             controller.signal_no_more_data()
 
         def _retry_owed_sentinels() -> None:
@@ -1501,6 +1672,15 @@ class DynamicMultiprocessingRunner(BaseRunner):
                     monitor._mark_shard_in_progress(rank, shard_id)
                     self._logger.info(f"Assigned shard {shard_id} to worker {rank}.")
 
+                elif _no_more_data() and controller.queue.empty():
+                    # Nothing can be produced *and* nothing is left buffered, so a
+                    # consumer here could only wait for a sentinel and complete again.
+                    # The queue check is the important half: while data is still buffered
+                    # the extra consumers are what drain it in parallel, which is the
+                    # whole point of stage 2.
+                    _release_finished_consumers()
+                    controller.stop_worker(rank)
+
                 else:
                     # Stage 2
 
@@ -1517,9 +1697,9 @@ class DynamicMultiprocessingRunner(BaseRunner):
                         finalizer_formatting=finalizer_formatting,
                     )
 
-                    # A worker joining as a consumer after the data has already run
-                    # out needs its own sentinel, or it would sit out the full timeout
-                    # on a queue that will never fill again.
+                    # A worker joining as a consumer just as the data runs out needs its
+                    # own sentinel, or it would sit out the full timeout on a queue that
+                    # will never fill again.
                     _release_finished_consumers()
 
                     # evenutally all workers are consumers
@@ -1556,9 +1736,37 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         # create a worker message queue
         msg_queue = mp.Queue()
-        # Shared across the workers on purpose: every one of them is handed the same
-        # transform, and pickling it once instead of once per worker is most of what
-        # keeps the controller responsive at high worker counts.
+        # Everything below is built *before* the workers so that `fork` carries it into
+        # each of them. None of it can usefully travel through the context pipe: the data
+        # queue is not picklable at all, and the transform is the same several-megabyte
+        # object for every worker, which used to cost a serialisation per worker and a
+        # deserialisation on each worker's critical path before its first shard.
+        data_queue = _CountedQueue(maxsize=self._num_workers)
+        queue_it = QueueExamplesIterable(
+            data_queue, sentinel=None, timeout=_QUEUE_GET_TIMEOUT, num_shards=num_shards
+        )
+        finalizer_formatting = (
+            None if formatting is None else FormattingConfig(format_type=formatting)
+        )
+        # Only `fork` hands a worker its transform for free. Under `spawn` (the default on
+        # macOS and Windows, and what the test suite runs under) the worker object is
+        # pickled to the child with the *standard* pickler, which is exactly what the
+        # dill-serialised context exists to avoid - a transform is routinely a closure or
+        # a partial that standard pickle cannot take. So there the transform keeps
+        # travelling through the context pipe, pickled once by the part cache.
+        inherits_memory = mp.get_start_method() == "fork"
+        base_ctx = (
+            WorkerContext(
+                data_transform=transform,
+                data_finalizer=finalizer,
+                data_finalizer_batch_size=batch_size,
+                data_finalizer_formatting=finalizer_formatting,
+            )
+            if inherits_memory
+            else None
+        )
+        # Still needed for the parts that genuinely differ mid-run, such as a producer's
+        # transform, and for start methods other than fork.
         ctx_part_cache = _ContextPartCache()
         # create all workers
         workers = [
@@ -1570,12 +1778,17 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 worker_init=self._worker_init,
                 worker_finalize=self._worker_finalize,
                 ctx_part_cache=ctx_part_cache,
+                base_ctx=None if base_ctx is None else replace(base_ctx),
+                queue_stream=queue_it,
+                queue_put=data_queue.put,
             )
             for rank in range(self._num_workers)
         ]
 
         # create controller
-        controller = WorkerController(workers, self._prefetch, num_shards)
+        controller = WorkerController(
+            workers, self._prefetch, num_shards, queue=data_queue, queue_it=queue_it
+        )
         controller.start()
 
         # create the progress monitor, note that the serializer dumps a batch of samples
@@ -1593,9 +1806,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
             transform=transform,
             finalizer=finalizer,
             finalizer_batch_size=batch_size,
-            finalizer_formatting=(
-                None if formatting is None else FormattingConfig(format_type=formatting)
-            ),
+            finalizer_formatting=finalizer_formatting,
             monitor=monitor,
             controller=controller,
             balancer=balancer,

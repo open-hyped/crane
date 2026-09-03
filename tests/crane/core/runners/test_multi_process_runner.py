@@ -1,7 +1,7 @@
 import json
 import multiprocessing as mp
 import time
-from queue import Full
+from queue import Full, Queue
 from unittest.mock import MagicMock, call, patch
 
 import datasets
@@ -20,6 +20,7 @@ from crane.core.runners.multi_process_runner import (
     WorkerContext,
     WorkerController,
     _ContextPartCache,
+    _CountedQueue,
     _PrePickled,
     _unwrap_parts,
 )
@@ -515,7 +516,10 @@ class TestConsumerShutdown:
 
     def test_signal_no_more_data_posts_one_sentinel_per_consumer(self):
         controller = WorkerController(
-            workers=[MagicMock(), MagicMock(), MagicMock()], prefetch=8, num_shards=2
+            workers=[MagicMock(), MagicMock(), MagicMock()],
+            prefetch=8,
+            num_shards=2,
+            queue=Queue(maxsize=3),
         )
         controller.consumer_ranks = {0, 1}
 
@@ -525,7 +529,9 @@ class TestConsumerShutdown:
         assert controller.queue.empty()
 
     def test_signal_no_more_data_is_a_no_op_without_consumers(self):
-        controller = WorkerController(workers=[MagicMock()], prefetch=8, num_shards=1)
+        controller = WorkerController(
+            workers=[MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=1)
+        )
 
         assert controller.signal_no_more_data() == 0
         assert controller.queue.empty()
@@ -700,7 +706,9 @@ class TestSentinelDelivery:
         # can still be full of real data. Dropping the attempt there left consumers to
         # discover the end by timing out - the 30 s stall this whole mechanism exists to
         # remove, reappearing as a rare but severe collapse.
-        controller = WorkerController(workers=[MagicMock()], prefetch=8, num_shards=1)
+        controller = WorkerController(
+            workers=[MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=1)
+        )
         controller.consumer_ranks = {0}
         controller.queue.put_nowait("data")  # maxsize is one worker, so now full
 
@@ -714,7 +722,9 @@ class TestSentinelDelivery:
         assert controller.queue.get_nowait() is controller.queue_it.sentinel
 
     def test_a_consumer_is_not_sent_two_sentinels(self):
-        controller = WorkerController(workers=[MagicMock(), MagicMock()], prefetch=8, num_shards=1)
+        controller = WorkerController(
+            workers=[MagicMock(), MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=2)
+        )
         controller.consumer_ranks = {0}
 
         assert controller.signal_no_more_data() == 1
@@ -724,7 +734,9 @@ class TestSentinelDelivery:
     def test_a_worker_re_entering_the_role_is_owed_another(self):
         # Freeing a worker and giving it the consumer role again is a fresh consumer
         # blocked on the queue, so the earlier sentinel does not cover it.
-        controller = WorkerController(workers=[MagicMock()], prefetch=8, num_shards=1)
+        controller = WorkerController(
+            workers=[MagicMock()], prefetch=8, num_shards=1, queue=Queue(maxsize=1)
+        )
         controller.consumer_ranks = {0}
         controller.signal_no_more_data()
         controller.queue.get_nowait()
@@ -734,3 +746,30 @@ class TestSentinelDelivery:
 
         assert controller.consumers_awaiting_sentinel == {0}
         assert controller.signal_no_more_data() == 1
+
+
+class TestCountedQueue:
+    """The queue replacing the manager-backed one, and the count that made it possible."""
+
+    def test_tracks_its_own_length(self):
+        # `mp.Queue.qsize()` is backed by `sem_getvalue()`, which macOS does not
+        # implement - the reason a manager proxy was used at all. Counting puts and gets
+        # gives a length everywhere, so a plain queue and its single pipe can be kept.
+        queue = _CountedQueue(maxsize=4)
+        assert queue.empty() and queue.qsize() == 0
+
+        queue.put("a")
+        queue.put("b")
+        assert queue.qsize() == 2 and not queue.empty()
+
+        assert queue.get(timeout=5) == "a"
+        assert queue.qsize() == 1
+        assert queue.get(timeout=5) == "b"
+        assert queue.empty()
+
+    def test_reports_full_without_blocking_forever(self):
+        queue = _CountedQueue(maxsize=1)
+        queue.put("a")
+        with pytest.raises(Full):
+            queue.put("b", timeout=0.1)
+        assert queue.get(timeout=5) == "a"
