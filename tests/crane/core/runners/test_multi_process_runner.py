@@ -19,6 +19,9 @@ from crane.core.runners.multi_process_runner import (
     Worker,
     WorkerContext,
     WorkerController,
+    _ContextPartCache,
+    _PrePickled,
+    _unwrap_parts,
 )
 from tests.third_party.sharedmock.mock import SharedMock
 
@@ -129,7 +132,9 @@ class TestWorker:
         worker.send_ctx(ctx)
 
         assert len(calls) == 2, "should have retried after the queue reported itself full"
-        assert dill.loads(worker._ctx_queue.get(timeout=1.0)) == ctx
+        # Heavy parts travel pre-serialised; `_recv_ctx` restores them, so the context
+        # the worker ends up with is what has to match.
+        assert _unwrap_parts(dill.loads(worker._ctx_queue.get(timeout=1.0))) == ctx
 
     def test_send_ctx_gives_up_without_raising(self, worker):
         # A worker that never drains its queue must not take the controller down with it.
@@ -429,15 +434,20 @@ def _another_transform(ex_iterable):
     return ex_iterable
 
 
-def _standalone_ctx(transform):
+def _standalone_ctx(transform=None, finalizer=None, batch_size=None, formatting=None):
     return WorkerContext(
         role=WorkerRole.STANDALONE,
         data_stream="STREAM",
         data_transform=transform,
+        data_finalizer=finalizer,
+        data_finalizer_batch_size=batch_size,
+        data_finalizer_formatting=formatting,
     )
 
 
 def _capture_sent(store):
+    """Record what went on the wire, with pre-pickled parts left as they were sent."""
+
     def capture(ctx_bytes, **kwargs):
         store.append(dill.loads(ctx_bytes))
         return True
@@ -541,3 +551,142 @@ class TestConsumerShutdown:
 
         fn.assert_has_calls([call(sample) for sample in ds], same_order=False)
         assert elapsed < 20, f"run took {elapsed:.1f}s, suggesting it sat out the queue timeout"
+
+
+def _a_finalizer(batch):
+    return None
+
+
+def _another_finalizer(batch):
+    return None
+
+
+class TestFinalizerReuse:
+    """The finalizer is re-sent only when it, or how it is called, actually changes."""
+
+    @pytest.fixture
+    def worker(self):
+        queue = mp.Queue()
+        worker = Worker(
+            rank=0,
+            num_workers=1,
+            msg_queue=queue,
+            progress_report_interval=0.0,
+            worker_init=MagicMock(),
+            worker_finalize=MagicMock(),
+        )
+        yield worker
+        queue.close()
+
+    def test_omits_a_finalizer_the_worker_already_has(self, worker):
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+
+        assert sent[0].data_finalizer is not None
+        assert sent[1].data_finalizer is None
+
+    def test_resends_when_the_finalizer_changes(self, worker):
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+            worker.send_ctx(
+                _standalone_ctx(finalizer=_another_finalizer, batch_size=8), blocking=False
+            )
+
+        assert sent[1].data_finalizer is not None
+
+    def test_resends_when_only_the_batch_size_changes(self, worker):
+        # `apply_ctx` applies the batch size and formatting only alongside a non-None
+        # finalizer, so dropping the finalizer would silently drop these with it - which
+        # is exactly what separates a producer's context from a standalone's.
+        sent = []
+        with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=8), blocking=False)
+            worker.send_ctx(_standalone_ctx(finalizer=_a_finalizer, batch_size=64), blocking=False)
+
+        assert sent[1].data_finalizer is not None
+        assert sent[1].data_finalizer_batch_size == 64
+
+
+class TestContextPartCache:
+    """One transform is pickled once for the whole run, not once per worker."""
+
+    def test_reuses_the_same_buffer_for_the_same_object(self):
+        cache = _ContextPartCache()
+        first = cache.dumps(_a_transform)
+        second = cache.dumps(_a_transform)
+
+        assert first.payload is second.payload
+        assert second.unwrap() is _a_transform
+
+    def test_serialises_distinct_objects_separately(self):
+        cache = _ContextPartCache()
+
+        assert cache.dumps(_a_transform).payload != cache.dumps(_another_transform).payload
+
+    def test_stops_growing_once_full(self):
+        # Role switches build a fresh bound method every time, so entries must not
+        # accumulate for the length of a run.
+        cache = _ContextPartCache(max_entries=2)
+        held = [lambda: None for _ in range(5)]
+        for fn in held:
+            cache.dumps(fn)
+
+        assert len(cache._entries) == 2
+
+    def test_workers_sharing_a_cache_pickle_a_transform_once(self):
+        cache = _ContextPartCache()
+        queue = mp.Queue()
+        workers = [
+            Worker(
+                rank=rank,
+                num_workers=2,
+                msg_queue=queue,
+                progress_report_interval=0.0,
+                worker_init=MagicMock(),
+                worker_finalize=MagicMock(),
+                ctx_part_cache=cache,
+            )
+            for rank in range(2)
+        ]
+        try:
+            sent = []
+            for worker in workers:
+                with patch.object(worker, "_send_ctx_bytes", side_effect=_capture_sent(sent)):
+                    worker.send_ctx(_standalone_ctx(transform=_a_transform), blocking=False)
+
+            # `_capture_sent` pickles what it captured, so buffer identity cannot
+            # survive it; that the cache holds one entry is what says it pickled once.
+            assert [type(ctx.data_transform) for ctx in sent] == [_PrePickled, _PrePickled]
+            assert sent[0].data_transform.payload == sent[1].data_transform.payload
+            assert len(cache._entries) == 1
+        finally:
+            queue.close()
+
+    def test_a_received_context_carries_the_real_callables(self):
+        # Whatever the wire format, what the worker applies has to be the originals.
+        cache = _ContextPartCache()
+        queue = mp.Queue()
+        worker = Worker(
+            rank=0,
+            num_workers=1,
+            msg_queue=queue,
+            progress_report_interval=0.0,
+            worker_init=MagicMock(),
+            worker_finalize=MagicMock(),
+            ctx_part_cache=cache,
+        )
+        try:
+            worker.send_ctx(
+                _standalone_ctx(transform=_a_transform, finalizer=_a_finalizer, batch_size=8),
+                blocking=False,
+            )
+            received = worker._recv_ctx(blocking=True, timeout=5.0)
+        finally:
+            queue.close()
+
+        assert received.data_transform is _a_transform
+        assert received.data_finalizer is _a_finalizer
+        assert received.data_finalizer_batch_size == 8

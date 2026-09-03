@@ -116,6 +116,68 @@ def _is_separable(ex_iterable: _BaseExamplesIterable) -> bool:
 
 
 @dataclass
+class _PrePickled:
+    """A context field that was serialised ahead of time.
+
+    `dill.dumps` walking a tokenizer's object graph costs ~0.8 s; copying the 5.7 MB of
+    bytes it produces costs a fraction of a millisecond. Every worker is handed the same
+    transform, so pickling it once and carrying the resulting buffer through each context
+    makes the unavoidable per-worker resends cost a memcpy instead of a full traversal.
+
+    The trade-off is that a part pickled on its own no longer shares structure with the
+    rest of the context: an object referenced by both a pre-pickled part and, say, the
+    data stream would arrive as two copies. Only the transform and finalizer are treated
+    this way, and neither shares state with a shard.
+    """
+
+    payload: bytes
+
+    def unwrap(self) -> Any:
+        """Deserialise the part."""
+        return dill.loads(self.payload)
+
+
+class _ContextPartCache:
+    """Serialises context parts once and hands the same bytes to every worker.
+
+    Keyed on object identity, which is only sound while the object is alive - a
+    collected object's id can be handed to another - so a reference is kept alongside
+    each entry. The parts worth caching are few and long-lived (one transform, one
+    finalizer per role), but role switches build a fresh bound method each time, so the
+    cache is capped rather than left to grow for the length of a run.
+    """
+
+    def __init__(self, max_entries: int = 32) -> None:
+        self._entries: dict[int, tuple[Any, bytes]] = {}
+        self._max_entries = max_entries
+
+    def dumps(self, obj: Any) -> _PrePickled:
+        """Return `obj` pre-serialised, reusing the bytes if it was seen before."""
+        key = id(obj)
+        entry = self._entries.get(key)
+        if entry is None:
+            payload = dill.dumps(obj)
+            if len(self._entries) < self._max_entries:
+                self._entries[key] = (obj, payload)
+        else:
+            payload = entry[1]
+        return _PrePickled(payload)
+
+
+def _unwrap_parts(ctx: WorkerContext) -> WorkerContext:
+    """Restore any pre-pickled parts of a context received by a worker."""
+    changes = {
+        field: value.unwrap()
+        for field, value in (
+            ("data_transform", ctx.data_transform),
+            ("data_finalizer", ctx.data_finalizer),
+        )
+        if isinstance(value, _PrePickled)
+    }
+    return replace(ctx, **changes) if changes else ctx
+
+
+@dataclass
 class WorkerContext:
     """Dataclass representing the context passed to workers.
 
@@ -245,6 +307,7 @@ class Worker(mp.Process):
         progress_report_interval: float,
         worker_init: Callable[[], Any],
         worker_finalize: Callable[[], Any],
+        ctx_part_cache: None | _ContextPartCache = None,
     ) -> None:
         """Initialize a worker process for parallel data processing.
 
@@ -260,6 +323,10 @@ class Worker(mp.Process):
                 state before processing begins.
             worker_finalize (Callable[[], Any]): A callable function to finalize the worker's
                 state after processing is complete.
+            ctx_part_cache (None | _ContextPartCache): Cache of pre-serialised context
+                parts, shared with the other workers so that a transform every worker
+                receives is pickled once rather than once per worker. Defaults to a
+                private cache.
         """
         super(Worker, self).__init__(daemon=True)
 
@@ -277,10 +344,14 @@ class Worker(mp.Process):
         # the worker context including the pipeline
         # to be executed by the worker
         self._ctx = WorkerContext()
-        # The transform this worker was last known to have *received*. Contexts are sent
-        # once per shard assignment but the transform rarely changes, and re-serialising
-        # it every time is expensive; see `_without_unchanged_transform`.
+        # What this worker was last known to have *received*. Contexts are sent once per
+        # shard assignment but these rarely change, and re-serialising them every time is
+        # expensive; see `_strip_parts_already_held`.
         self._last_transform: None | Callable = None
+        self._last_finalizer: None | tuple = None
+        # Shared with the other workers so one transform is pickled once for all of them,
+        # not once each. A worker given no cache keeps its own, which is still correct.
+        self._ctx_part_cache = ctx_part_cache if ctx_part_cache is not None else _ContextPartCache()
 
         # create logger
         self._logger = logging.getLogger(f"{type(self).__module__}.{type(self).__qualname__}")
@@ -319,13 +390,14 @@ class Worker(mp.Process):
             self._recv_ctx_resp_conn.recv()
 
         # serialize and send context
-        ctx, transform = self._without_unchanged_transform(ctx)
-        ctx_bytes = dill.dumps(ctx)
+        ctx, transform, finalizer = self._strip_parts_already_held(ctx)
+        ctx_bytes = dill.dumps(self._prepickle_parts(ctx))
         if self._send_ctx_bytes(ctx_bytes):
-            # Only now is the worker known to have it. Recording delivery for a context
-            # that was dropped would strip the transform from every later context too,
+            # Only now is the worker known to hold these. Recording delivery for a
+            # context that was dropped would strip them from every later context too,
             # leaving the worker with no pipeline at all.
             self._last_transform = transform
+            self._last_finalizer = finalizer
 
         if blocking:
             # wait for feedback from worker
@@ -340,36 +412,80 @@ class Worker(mp.Process):
             self._logger.debug(f"Sent new context to worker {self._rank} in non-blocking mode.")
             return True
 
-    def _without_unchanged_transform(
+    def _strip_parts_already_held(
         self, ctx: WorkerContext
-    ) -> tuple[WorkerContext, None | Callable]:
-        """Drop `data_transform` from a context whose worker already holds it.
+    ) -> tuple[WorkerContext, None | Callable, None | tuple]:
+        """Drop the parts of a context this worker already holds.
 
         The transform closes over whatever the workload needs, and for a tokenising
         pipeline that is the tokenizer - measured at 5.7 MB and 0.8 s to pickle. A
         context is sent once per shard assignment, so a 64-shard run spent ~50 s doing
-        nothing but re-serialising an object that never changed. Worse, `dill.dumps`
-        runs on the controller's single-threaded message loop, so while it worked every
-        other worker asking for its next shard was kept waiting: workers were measured
-        idle 52% of the time.
+        nothing but re-serialising objects that never changed. Worse, `dill.dumps` runs
+        on the controller's single-threaded message loop, so while it worked every other
+        worker asking for its next shard was kept waiting: workers were measured idle
+        52% of the time. The finalizer is re-sent just as often and costs about 2 MB.
 
         `WorkerContext.apply_ctx` keeps the previous value for any field arriving as
         None, and the worker's `_ctx` persists across contexts, so omitting an unchanged
-        transform is exactly equivalent to sending it again.
+        part is exactly equivalent to sending it again.
 
-        The comparison is by identity rather than an unconditional blanking, because a
-        producer context carries a *different* transform and a role switch must still
-        deliver it.
+        Comparison is by identity rather than an unconditional blanking, because a
+        producer context carries a *different* transform and finalizer, and a role
+        switch must still deliver them. The finalizer additionally carries its batch
+        size and formatting, which `apply_ctx` only applies alongside a non-None
+        finalizer - so it is only dropped when all three match, and a change to any of
+        them re-sends the set.
 
         Returns:
-            tuple[WorkerContext, None | Callable]: the context to send, and the
-            transform the worker will hold once it arrives.
+            tuple[WorkerContext, None | Callable, None | tuple]: the context to send,
+            and the transform and finalizer set the worker will hold once it arrives.
         """
-        if ctx.data_transform is None:
-            return ctx, self._last_transform
-        if ctx.data_transform is self._last_transform:
-            return replace(ctx, data_transform=None), self._last_transform
-        return ctx, ctx.data_transform
+        transform = self._last_transform
+        finalizer = self._last_finalizer
+        dropped: dict[str, None] = {}
+
+        if ctx.data_transform is not None:
+            if ctx.data_transform is self._last_transform:
+                dropped["data_transform"] = None
+            else:
+                transform = ctx.data_transform
+
+        if ctx.data_finalizer is not None:
+            candidate = (
+                ctx.data_finalizer,
+                ctx.data_finalizer_batch_size,
+                ctx.data_finalizer_formatting,
+            )
+            held = self._last_finalizer
+            if (
+                held is not None
+                and candidate[0] is held[0]
+                and candidate[1] == held[1]
+                and candidate[2] == held[2]
+            ):
+                dropped["data_finalizer"] = None
+            else:
+                finalizer = candidate
+
+        return (replace(ctx, **dropped) if dropped else ctx), transform, finalizer
+
+    def _prepickle_parts(self, ctx: WorkerContext) -> WorkerContext:
+        """Swap the heavy callables for buffers the cache has already serialised.
+
+        What survives `_strip_parts_already_held` is a part the worker genuinely does
+        not have yet - the first context of a run, or a role switch. Every worker needs
+        the same transform, so without this the controller pickles it once per worker;
+        with it, only the first pays.
+        """
+        prepickled = {
+            field: self._ctx_part_cache.dumps(value)
+            for field, value in (
+                ("data_transform", ctx.data_transform),
+                ("data_finalizer", ctx.data_finalizer),
+            )
+            if value is not None
+        }
+        return replace(ctx, **prepickled) if prepickled else ctx
 
     def _send_ctx_bytes(self, ctx_bytes: bytes, timeout: float = _CTX_SEND_TIMEOUT) -> bool:
         """Replace whatever context is queued for the worker with `ctx_bytes`.
@@ -470,7 +586,7 @@ class Worker(mp.Process):
         """
         try:
             ctx_bytes = self._ctx_queue.get(block=blocking, timeout=timeout)
-            ctx = dill.loads(ctx_bytes)
+            ctx = _unwrap_parts(dill.loads(ctx_bytes))
             self._logger.debug(f"Received {ctx}.")
             return ctx
         except Empty:
@@ -1397,6 +1513,10 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         # create a worker message queue
         msg_queue = mp.Queue()
+        # Shared across the workers on purpose: every one of them is handed the same
+        # transform, and pickling it once instead of once per worker is most of what
+        # keeps the controller responsive at high worker counts.
+        ctx_part_cache = _ContextPartCache()
         # create all workers
         workers = [
             Worker(
@@ -1406,6 +1526,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
                 progress_report_interval=self._report_interval,
                 worker_init=self._worker_init,
                 worker_finalize=self._worker_finalize,
+                ctx_part_cache=ctx_part_cache,
             )
             for rank in range(self._num_workers)
         ]
