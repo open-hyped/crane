@@ -96,12 +96,12 @@ ds = datasets.load_from_disk("data")
 
 ## Running on a Cluster
 
-When one machine is not enough, `crane.dist` spreads the same write across the jobs of a
+When one machine is not enough, `crane.distributed` spreads the same write across the jobs of a
 cluster. Nothing about the dataset or the writer changes - only where the work happens:
 
 ```python
 from crane import ArrowDatasetWriter
-from crane.dist import Slurm
+from crane.distributed import Slurm
 
 writer = ArrowDatasetWriter("/shared/data", overwrite=True)
 
@@ -135,7 +135,7 @@ run = writer.submit(ds, on=Slurm(num_jobs=16, partition="cpu"))
 print(run.run_dir)                  # note this down, then close the laptop
 
 # later, from anywhere that can see the run directory
-from crane.dist import attach
+from crane.distributed import attach
 
 run = attach("/shared/data/.crane/data-2f9c1a")
 run.watch()                         # progress across every job

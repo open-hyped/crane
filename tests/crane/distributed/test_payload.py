@@ -5,7 +5,7 @@ import datasets
 import pytest
 
 from crane import ArrowDatasetWriter
-from crane.dist.core import payload
+from crane.distributed.core import payload
 
 
 @pytest.fixture

@@ -181,6 +181,8 @@ class DistributedRun(object):
         Returns only once the metadata has been written too, so that what it returns to is
         a dataset that can be loaded rather than one that has merely finished computing.
 
+        Acts on the run's failure policy while it waits; see :func:`_follow`.
+
         Args:
             timeout (None | float): Give up waiting after this many seconds. The run is not
                 cancelled; only the waiting stops. Defaults to waiting indefinitely.
@@ -192,6 +194,76 @@ class DistributedRun(object):
             JobLostError: If any job vanished without reporting.
             TimeoutError: If :code:`timeout` passed while the run was still going.
         """
+        status = self._follow(timeout=timeout, poll_interval=poll_interval)
+
+        if status.failures:
+            # The same error a local run raises, with the same contents: every failure the
+            # workload reported, from whichever job reported it.
+            raise ShardProcessingError(status.failures)
+
+        if status.lost_jobs:
+            raise JobLostError(
+                f"Job(s) {status.lost_jobs} of run {self.run_id} ended without reporting. "
+                f"This is not a failure of the workload - the job was killed by something "
+                f"outside it, such as the walltime, a preemption or an out-of-memory kill. "
+                f"See `run.logs(job_index)`."
+            )
+
+    def watch(self, timeout: None | float = None, poll_interval: float = 1.0) -> None:
+        """Follow the run with a progress bar, until it finishes.
+
+        Counts shards completed across every job, which is the one measure that survives
+        the trip off the machine. Per-job throughput stays in the per-job logs, where the
+        numbers mean something.
+
+        Watching a run drives it exactly as waiting for one does - the failure policy is
+        acted on either way, because both are somebody following the run and it would be
+        strange for the same failure to stop the cluster through one method and not the
+        other. Unlike :func:`wait`, this returns quietly when the run has failed; ask
+        :func:`status` or :func:`wait` what went wrong.
+
+        Args:
+            timeout (None | float): Give up following after this many seconds. The run is
+                not cancelled; only the watching stops. Defaults to waiting indefinitely.
+            poll_interval (float): How often to refresh, in seconds.
+
+        Raises:
+            TimeoutError: If :code:`timeout` passed while the run was still going.
+        """
+        with tqdm(total=self._spec.num_shards, unit="sh", desc=self.run_id) as pbar:
+
+            def draw(status: RunStatus) -> None:
+                done = sum(s is JobState.COMPLETED for s in status.jobs.values())
+                pbar.set_postfix_str(f"{status.state.value}, {done}/{self.num_jobs} jobs")
+                pbar.update(status.shards_completed - pbar.n)
+
+            self._follow(timeout=timeout, poll_interval=poll_interval, on_status=draw)
+
+    def _follow(
+        self,
+        timeout: None | float,
+        poll_interval: float,
+        on_status: None | Callable[[RunStatus], None] = None,
+    ) -> RunStatus:
+        """Poll until the run settles, acting on its failure policy as it goes.
+
+        The one loop behind :func:`wait` and :func:`watch`, so that following a run means
+        the same thing whichever of them is used.
+
+        Args:
+            timeout (None | float): Give up after this many seconds. The run is not
+                cancelled; only the following stops. None waits indefinitely.
+            poll_interval (float): How often to ask the scheduler for news, in seconds.
+            on_status (None | Callable[[RunStatus], None]): Called with each snapshot, for
+                a caller that wants to show progress.
+
+        Returns:
+            RunStatus: How the run ended - or how it stood when it was stopped, which is not
+            the same thing; see below.
+
+        Raises:
+            TimeoutError: If :code:`timeout` passed while the run was still going.
+        """
         deadline = None if timeout is None else time.monotonic() + timeout
         # What had gone wrong at the moment the run was stopped, if it was. Kept because
         # cancelling the siblings makes them look lost too, and reporting the jobs this
@@ -200,6 +272,9 @@ class DistributedRun(object):
 
         while True:
             status = self.status()
+
+            if on_status is not None:
+                on_status(status)
 
             if (stopped_on is None) and self._should_stop_the_rest(status):
                 logger.error(
@@ -223,20 +298,7 @@ class DistributedRun(object):
 
         # A run that was stopped is reported as it was when the decision was taken, not as
         # it looks afterwards.
-        status = stopped_on if stopped_on is not None else status
-
-        if status.failures:
-            # The same error a local run raises, with the same contents: every failure the
-            # workload reported, from whichever job reported it.
-            raise ShardProcessingError(status.failures)
-
-        if status.lost_jobs:
-            raise JobLostError(
-                f"Job(s) {status.lost_jobs} of run {self.run_id} ended without reporting. "
-                f"This is not a failure of the workload - the job was killed by something "
-                f"outside it, such as the walltime, a preemption or an out-of-memory kill. "
-                f"See `run.logs(job_index)`."
-            )
+        return stopped_on if stopped_on is not None else status
 
     def _should_stop_the_rest(self, status: RunStatus) -> bool:
         """Whether a failure means the jobs still running should be stopped.
@@ -250,8 +312,8 @@ class DistributedRun(object):
         :attr:`FailurePolicy.SKIP_SHARD` means the opposite - the failed shards are expected
         losses - so the other jobs carry on.
 
-        **Note**: this only happens while something is watching. A run left alone after
-        :func:`submit` keeps going until its jobs finish on their own.
+        **Note**: this only happens while something is following the run. One left alone
+        after :func:`submit` keeps going until its jobs finish on their own.
 
         Args:
             status (RunStatus): The snapshot to judge.
@@ -265,29 +327,6 @@ class DistributedRun(object):
         # A lost job is not counted here: it is not the workload failing, and a run that
         # loses one job to a preemption may still be worth letting finish.
         return bool(status.failures)
-
-    def watch(self, poll_interval: float = 1.0) -> None:
-        """Follow the run with a progress bar, until it finishes.
-
-        Counts shards completed across every job, which is the one measure that survives
-        the trip off the machine. Per-job throughput stays in the per-job logs, where the
-        numbers mean something.
-
-        Args:
-            poll_interval (float): How often to refresh, in seconds.
-        """
-        with tqdm(total=self._spec.num_shards, unit="sh", desc=self.run_id) as pbar:
-            while True:
-                status = self.status()
-                done = sum(s is JobState.COMPLETED for s in status.jobs.values())
-
-                pbar.set_postfix_str(f"{status.state.value}, {done}/{self.num_jobs} jobs")
-                pbar.update(status.shards_completed - pbar.n)
-
-                if status.state in (RunState.COMPLETED, RunState.FAILED):
-                    break
-
-                time.sleep(poll_interval)
 
     def cancel(self) -> None:
         """Stop every job of the run, the finalize job included."""

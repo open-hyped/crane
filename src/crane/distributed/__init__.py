@@ -9,7 +9,7 @@ The backend is passed to :func:`submit`, which returns as soon as the work is qu
 .. code-block:: python
 
     from crane import ArrowDatasetWriter
-    from crane.dist import Slurm
+    from crane.distributed import Slurm
 
     writer = ArrowDatasetWriter("/shared/out", overwrite=True)
     run = writer.submit(ds, on=Slurm(num_jobs=16, partition="cpu", cpus_per_task=8))
@@ -19,7 +19,7 @@ A run can be picked up again from another process, or another machine, with
 :func:`attach` and the run directory it printed when it was submitted.
 
 The backends live at this level, beside this module; everything they are built from is in
-:mod:`crane.dist.core`.
+:mod:`crane.distributed.core`.
 """
 
 __all__ = [

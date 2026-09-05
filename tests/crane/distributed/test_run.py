@@ -6,8 +6,8 @@ from typing import ClassVar
 import pytest
 
 from crane.core.runners.base import ShardProcessingError
-from crane.dist.core.base import BackendView, DistributedBackend, JobState, RunSpec, RunState
-from crane.dist.core.run import DistributedRun, JobLostError, RunNotFoundError, attach
+from crane.distributed.core.base import BackendView, DistributedBackend, JobState, RunSpec, RunState
+from crane.distributed.core.run import DistributedRun, JobLostError, RunNotFoundError, attach
 
 
 @dataclass(frozen=True)
@@ -223,6 +223,26 @@ class TestStopTheRestOnFailure:
 
         assert run._backend.cancelled == []
 
+    def test_watching_stops_the_rest_just_as_waiting_does(self, spec):
+        # following a run means the same thing whichever method does it
+        _report(spec, 0, failures=[_failure(0, 2)])
+        run = _run(spec, active={1: "running"})
+
+        run.watch(timeout=5, poll_interval=0.01)
+
+        assert run._backend.cancelled == [["1"]], "watch left the remaining jobs running"
+
+    def test_watching_a_skipped_shard_lets_the_run_carry_on(self, spec):
+        spec = RunSpec(**(spec.__dict__ | {"failure_policy": "skip_shard"}))
+        spec.save()
+        _report(spec, 0, failures=[_failure(0, 2)])
+        _report(spec, 1)
+        run = _run(spec)
+
+        run.watch(timeout=5, poll_interval=0.01)
+
+        assert run._backend.cancelled == []
+
 
 class TestLogs:
     def test_reads_a_job_log(self, spec):
@@ -256,12 +276,12 @@ class TestAttach:
 
 class TestWorkDir:
     def test_defaults_beside_the_dataset(self, tmp_path):
-        from crane.dist.core.run import _work_dir
+        from crane.distributed.core.run import _work_dir
 
         assert _work_dir(_FakeBackend(), "/data/out") == os.path.join("/data/out", ".crane")
 
     def test_a_consumer_without_a_work_dir_is_an_error(self):
-        from crane.dist.core.run import _work_dir
+        from crane.distributed.core.run import _work_dir
 
         with pytest.raises(ValueError, match="Pass `work_dir`"):
             _work_dir(_FakeBackend(), None)
@@ -269,12 +289,12 @@ class TestWorkDir:
 
 class TestRunId:
     def test_names_the_run_after_the_output(self):
-        from crane.dist.core.run import _make_run_id
+        from crane.distributed.core.run import _make_run_id
 
         assert _make_run_id(None, "/shared/fineweb-annotated").startswith("fineweb-annotated-")
 
     def test_is_unique_per_submission(self):
-        from crane.dist.core.run import _make_run_id
+        from crane.distributed.core.run import _make_run_id
 
         # a resubmission must not collide with the run it repeats
         assert _make_run_id(None, "/out") != _make_run_id(None, "/out")

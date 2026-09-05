@@ -19,8 +19,8 @@ from .runners.main_process_runner import MainProcessRunner
 from .runners.multi_process_runner import DynamicMultiprocessingRunner
 
 if TYPE_CHECKING:  # pragma: not covered
-    from ..dist.core.base import DistributedBackend
-    from ..dist.core.run import DistributedRun
+    from ..distributed.core.base import DistributedBackend
+    from ..distributed.core.run import DistributedRun
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +182,9 @@ class DatasetConsumer(object):
             DistributedRun: A handle on the submitted run.
         """
         # Imported here rather than at module scope so that the consume path stays usable
-        # without the distributed stack, and to keep `crane.dist` free to import from
+        # without the distributed stack, and to keep `crane.distributed` free to import from
         # `crane.core`.
-        from ..dist.core.run import submit as submit_run
+        from ..distributed.core.run import submit as submit_run
 
         return submit_run(
             ds=ds,

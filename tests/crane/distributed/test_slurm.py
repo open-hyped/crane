@@ -3,8 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from crane.dist.core.base import JobState, RunSpec
-from crane.dist.slurm import MAX_NUM_JOBS, Slurm, SlurmNotAvailableError
+from crane.distributed.core.base import JobState, RunSpec
+from crane.distributed.slurm import MAX_NUM_JOBS, Slurm, SlurmNotAvailableError
 
 
 @pytest.fixture
@@ -47,12 +47,12 @@ class TestJobCount:
 class TestAvailability:
     def test_submit_refuses_without_slurm(self, spec):
         # the error has to say what is missing and what to do instead
-        with patch("crane.dist.slurm.shutil.which", return_value=None):
+        with patch("crane.distributed.slurm.shutil.which", return_value=None):
             with pytest.raises(SlurmNotAvailableError, match="sbatch"):
                 Slurm(num_jobs=4).submit(spec)
 
     def test_error_points_at_the_local_alternative(self, spec):
-        with patch("crane.dist.slurm.shutil.which", return_value=None):
+        with patch("crane.distributed.slurm.shutil.which", return_value=None):
             with pytest.raises(SlurmNotAvailableError, match="`write` rather than `submit`"):
                 Slurm(num_jobs=4).poll(spec, ["1"])
 
@@ -103,11 +103,11 @@ class TestScript:
         # a job killed during startup must not leave an empty log
         script = Slurm(num_jobs=4)._script(spec, "logs", ["the-command"], array=True)
         assert "export PYTHONUNBUFFERED=1" in script
-        assert script.index("echo \"crane: run out-abc123") < script.index("the-command")
+        assert script.index('echo "crane: run out-abc123') < script.index("the-command")
 
     def test_dry_run_submits_nothing(self, spec, capsys):
-        with patch("crane.dist.slurm.shutil.which", return_value="/usr/bin/sbatch"):
-            with patch("crane.dist.slurm._run") as run:
+        with patch("crane.distributed.slurm.shutil.which", return_value="/usr/bin/sbatch"):
+            with patch("crane.distributed.slurm._run") as run:
                 assert Slurm(num_jobs=4, dry_run=True).submit(spec) == []
                 run.assert_not_called()
         assert "#SBATCH" in capsys.readouterr().out
@@ -116,12 +116,12 @@ class TestScript:
 class TestSubmit:
     @pytest.fixture(autouse=True)
     def _slurm_available(self):
-        with patch("crane.dist.slurm.shutil.which", return_value="/usr/bin/sbatch"):
+        with patch("crane.distributed.slurm.shutil.which", return_value="/usr/bin/sbatch"):
             yield
 
     def test_submits_array_then_dependent_finalize(self, spec):
         side_effect = [_completed("111"), _completed("222")]
-        with patch("crane.dist.slurm._run", side_effect=side_effect) as run:
+        with patch("crane.distributed.slurm._run", side_effect=side_effect) as run:
             assert Slurm(num_jobs=4).submit(spec) == ["111", "222"]
 
         # the finalize job must not start unless every worker succeeded
@@ -129,26 +129,26 @@ class TestSubmit:
 
     def test_no_finalize_job_when_nothing_needs_finalizing(self, spec, tmp_path):
         spec = RunSpec(**(spec.__dict__ | {"needs_finalize": False}))
-        with patch("crane.dist.slurm._run", side_effect=[_completed("111")]) as run:
+        with patch("crane.distributed.slurm._run", side_effect=[_completed("111")]) as run:
             assert Slurm(num_jobs=4).submit(spec) == ["111"]
         assert run.call_count == 1
 
     def test_parses_only_the_job_id(self, spec):
         # `sbatch --parsable` appends `;cluster` on a federated setup
         side_effect = [_completed("111;cluster"), _completed("222")]
-        with patch("crane.dist.slurm._run", side_effect=side_effect):
+        with patch("crane.distributed.slurm._run", side_effect=side_effect):
             assert Slurm(num_jobs=4).submit(spec)[0] == "111"
 
 
 class TestPoll:
     @pytest.fixture(autouse=True)
     def _slurm_available(self):
-        with patch("crane.dist.slurm.shutil.which", return_value="/usr/bin/squeue"):
+        with patch("crane.distributed.slurm.shutil.which", return_value="/usr/bin/squeue"):
             yield
 
     def test_reads_array_task_states(self, spec):
         with patch(
-            "crane.dist.slurm._run",
+            "crane.distributed.slurm._run",
             side_effect=[_completed("0;RUNNING\n2;PENDING\n"), _completed("")],
         ):
             view = Slurm(num_jobs=4).poll(spec, ["111", "222"])
@@ -158,24 +158,28 @@ class TestPoll:
 
     def test_a_job_out_of_the_queue_is_not_active(self, spec):
         # squeue exits non-zero for a job it no longer knows, which is an answer
-        with patch("crane.dist.slurm._run", side_effect=[_completed("", 1), _completed("", 1)]):
+        with patch(
+            "crane.distributed.slurm._run", side_effect=[_completed("", 1), _completed("", 1)]
+        ):
             view = Slurm(num_jobs=4).poll(spec, ["111", "222"])
         assert view.active_jobs == {}
 
     def test_finalize_pending_is_reported(self, spec):
-        with patch("crane.dist.slurm._run", side_effect=[_completed(""), _completed("PENDING\n")]):
+        with patch(
+            "crane.distributed.slurm._run", side_effect=[_completed(""), _completed("PENDING\n")]
+        ):
             assert Slurm(num_jobs=4).poll(spec, ["111", "222"]).finalize_pending
 
     def test_transient_states_count_as_running(self, spec):
         side_effect = [_completed("1;COMPLETING\n"), _completed("")]
-        with patch("crane.dist.slurm._run", side_effect=side_effect):
+        with patch("crane.distributed.slurm._run", side_effect=side_effect):
             view = Slurm(num_jobs=4).poll(spec, ["111", "222"])
         assert view.active_jobs == {1: JobState.RUNNING}
 
 
 class TestCancel:
     def test_cancels_every_job(self, spec):
-        with patch("crane.dist.slurm.shutil.which", return_value="/usr/bin/scancel"):
-            with patch("crane.dist.slurm._run") as run:
+        with patch("crane.distributed.slurm.shutil.which", return_value="/usr/bin/scancel"):
+            with patch("crane.distributed.slurm._run") as run:
                 Slurm(num_jobs=4).cancel(spec, ["111", "222"])
         assert run.call_args.args[0] == ["scancel", "111", "222"]

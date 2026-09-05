@@ -5,7 +5,7 @@ from typing import ClassVar
 
 import pytest
 
-from crane.dist.core.base import (
+from crane.distributed.core.base import (
     BackendView,
     DistributedBackend,
     JobState,
@@ -13,7 +13,7 @@ from crane.dist.core.base import (
     RunState,
     RunStatus,
 )
-from crane.dist.slurm import Slurm
+from crane.distributed.slurm import Slurm
 
 
 @dataclass(frozen=True)

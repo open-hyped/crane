@@ -5,7 +5,7 @@ run and the interface a backend implements, how a dataset's shards are divided b
 jobs, what travels to a job and how, the handle a submitted run is driven through, and the
 entry point a job actually executes.
 
-The backends themselves are not here. They are the user-facing half of :mod:`crane.dist`
+The backends themselves are not here. They are the user-facing half of :mod:`crane.distributed`
 and live beside it, in the same way the concrete writers live beside :mod:`crane.core`.
 """
 

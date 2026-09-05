@@ -7,8 +7,8 @@ import datasets
 import pytest
 
 from crane import ArrowDatasetWriter, JsonDatasetWriter
-from crane.dist.core._entrypoint import run_finalize, run_worker
-from crane.dist.core.base import BackendView, DistributedBackend, RunState
+from crane.distributed.core._entrypoint import run_finalize, run_worker
+from crane.distributed.core.base import BackendView, DistributedBackend, RunState
 
 NUM_SHARDS, ROWS_PER_SHARD = 6, 5
 
@@ -108,7 +108,9 @@ class TestDistributedWrite:
         _run_all_jobs(run)
 
         assert sorted(os.listdir(os.path.join(run.run_dir, "jobs"))) == [
-            "0.json", "1.json", "2.json"
+            "0.json",
+            "1.json",
+            "2.json",
         ]
         # one marker per shard, named per job so two jobs cannot overwrite each other
         assert len(os.listdir(os.path.join(run.run_dir, "shards"))) == NUM_SHARDS

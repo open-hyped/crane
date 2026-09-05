@@ -98,7 +98,5 @@ def select_shards(ds: IterableDataset, num_jobs: int, job_index: int) -> Iterabl
         split=ds.split,
         formatting=ds._formatting,
     )
-    logger.info(
-        f"Job {job_index} of {num_jobs} took {shard_ds.n_shards} of {ds.n_shards} shards."
-    )
+    logger.info(f"Job {job_index} of {num_jobs} took {shard_ds.n_shards} of {ds.n_shards} shards.")
     return shard_ds

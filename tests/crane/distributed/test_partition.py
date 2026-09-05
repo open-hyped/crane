@@ -1,7 +1,7 @@
 import datasets
 import pytest
 
-from crane.dist.core.partition import num_jobs_for, select_shards
+from crane.distributed.core.partition import num_jobs_for, select_shards
 
 
 def _dataset(num_shards: int, rows_per_shard: int = 4) -> datasets.IterableDataset:

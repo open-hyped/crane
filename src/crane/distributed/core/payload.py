@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # pragma: not covered
 class Payload(object):
     """Everything a job needs that is fixed for the whole run.
 
-    Written once by :func:`crane.dist.submit` and read by every worker job and by the
+    Written once by :func:`crane.distributed.submit` and read by every worker job and by the
     finalize job, so that the three cannot drift apart.
 
     Dill rather than pickle for the same reason :class:`WorkerSetup` uses it: a transform is

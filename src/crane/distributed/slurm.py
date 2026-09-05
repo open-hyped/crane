@@ -87,8 +87,7 @@ def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
 
     if check and proc.returncode != 0:
         raise RuntimeError(
-            f"`{' '.join(args)}` failed with exit code {proc.returncode}: "
-            f"{proc.stderr.strip()}"
+            f"`{' '.join(args)}` failed with exit code {proc.returncode}: " f"{proc.stderr.strip()}"
         )
 
     return proc
@@ -137,7 +136,7 @@ class Slurm(DistributedBackend):
     """The job's name. Defaults to the run id.
 
     Only cosmetic: a run is identified by its :code:`--comment`, so renaming the job does
-    not hide it from :func:`crane.dist.attach`.
+    not hide it from :func:`crane.distributed.attach`.
     """
 
     logs_dir: None | str = None
@@ -306,7 +305,7 @@ class Slurm(DistributedBackend):
         logs_dir = self.logs_dir or os.path.join(spec.run_dir, "logs")
         os.makedirs(logs_dir, exist_ok=True)
 
-        entrypoint = [spec.python, "-m", "crane.dist.core._entrypoint", spec.run_dir]
+        entrypoint = [spec.python, "-m", "crane.distributed.core._entrypoint", spec.run_dir]
         worker_script = self._script(
             spec,
             logs_dir,
@@ -318,11 +317,13 @@ class Slurm(DistributedBackend):
         )
 
         if self.dry_run:
-            print(f"# {spec.num_jobs} worker job(s) over {spec.num_shards} shard(s)")
-            print(worker_script)
+            # Printed rather than logged: showing the caller what would be submitted is the
+            # whole point of a dry run, and it should reach them whatever the log level is.
+            print(f"# {spec.num_jobs} worker job(s) over {spec.num_shards} shard(s)")  # noqa: T201
+            print(worker_script)  # noqa: T201
             if spec.needs_finalize:
-                print("\n# finalize, after the workers succeed")
-                print(finalize_script)
+                print("\n# finalize, after the workers succeed")  # noqa: T201
+                print(finalize_script)  # noqa: T201
             return []
 
         job_ids = [self._sbatch(worker_script, os.path.join(spec.run_dir, "worker.sbatch"))]
@@ -416,4 +417,3 @@ class Slurm(DistributedBackend):
         if job_ids:
             _run(["scancel", *job_ids], check=False)
             logger.info(f"Cancelled slurm job(s) {', '.join(job_ids)}.")
-

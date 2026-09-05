@@ -90,7 +90,7 @@ class RunSpec:
     """The description of a run, as written to the run directory.
 
     Everything needed to rebuild a handle for a run in another process, days later, is
-    here; see :func:`crane.dist.attach`.
+    here; see :func:`crane.distributed.attach`.
     """
 
     run_id: str

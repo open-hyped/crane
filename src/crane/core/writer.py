@@ -37,8 +37,8 @@ from .utils import Compose, FormatType, RunAll, chdir
 from .worker import get_worker_info
 
 if TYPE_CHECKING:  # pragma: not covered
-    from ..dist.core.base import DistributedBackend
-    from ..dist.core.run import DistributedRun
+    from ..distributed.core.base import DistributedBackend
+    from ..distributed.core.run import DistributedRun
 
 logger = logging.getLogger(__name__)
 
@@ -558,9 +558,9 @@ class BaseDatasetWriter(ABC):
             DistributedRun: A handle on the submitted run.
         """
         # Imported here rather than at module scope so that the write path stays usable
-        # without the distributed stack, and to keep `crane.dist` free to import from
+        # without the distributed stack, and to keep `crane.distributed` free to import from
         # `crane.core`.
-        from ..dist.core.run import submit as submit_run
+        from ..distributed.core.run import submit as submit_run
 
         self._prepare_save_dir()
         return submit_run(
@@ -617,7 +617,7 @@ class BaseDatasetWriter(ABC):
         for split, save_dir in self._iter_splits(ds):
             if job_index is not None:
                 # Imported lazily; see `submit`.
-                from ..dist.core.partition import select_shards
+                from ..distributed.core.partition import select_shards
 
                 split = select_shards(split, num_jobs, job_index)
 

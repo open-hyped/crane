@@ -4,8 +4,8 @@ Two modes, one module:
 
 .. code-block:: bash
 
-    python -m crane.dist._entrypoint <run_dir> --job-index <i>   # one job's shards
-    python -m crane.dist._entrypoint <run_dir> --finalize        # the metadata, once
+    python -m crane.distributed._entrypoint <run_dir> --job-index <i>   # one job's shards
+    python -m crane.distributed._entrypoint <run_dir> --finalize        # the metadata, once
 
 Kept separate from :func:`write` and :func:`submit` so that each of the three does one
 thing: run here, run locally, or launch.
@@ -199,9 +199,7 @@ def main(argv: None | list[str] = None) -> int:
     parser.add_argument("run_dir", help="The run directory holding the payload.")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--job-index", type=int, help="Process this job's share of the shards.")
-    group.add_argument(
-        "--finalize", action="store_true", help="Write the dataset metadata, once."
-    )
+    group.add_argument("--finalize", action="store_true", help="Write the dataset metadata, once.")
     args = parser.parse_args(argv)
 
     # A job has no terminal to watch, so default it to a level worth keeping in the log.
