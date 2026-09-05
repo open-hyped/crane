@@ -278,15 +278,13 @@ class BaseDatasetWriter(ABC):
             formatting=formatting,
         )
 
-        # wrap write function in sharding callback if needed
-        write_fn = (
-            write_fn
-            if not sharding_controller.is_active
-            else Compose(
-                sharding_controller.update,
-                write_fn,
-                sharding_controller.callback,
-            )
+        # The controller opens a shard on the first batch a worker actually writes, so it has
+        # to see every batch - including under the NONE strategy, where it opens the single
+        # shard but never rolls over.
+        write_fn = Compose(
+            sharding_controller.update,
+            write_fn,
+            sharding_controller.callback,
         )
 
         logger.info(f"Writing dataset split {ds.split} to {os.getcwd()}.")
@@ -297,10 +295,9 @@ class BaseDatasetWriter(ABC):
             consumer = DatasetConsumer(
                 num_proc=self._num_proc,
                 prefetch_factor=self._prefetch,
-                on_start=RunAll(
-                    sharding_controller.initialize,
-                    partial(self.initialize, ds.info),
-                ),
+                # no shard is opened here: a worker that never receives data must not leave
+                # an empty shard file behind, so the controller opens one on first write
+                on_start=partial(self.initialize, ds.info),
                 on_finish=RunAll(
                     sharding_controller.finalize,
                     partial(self.finalize, ds.info),

@@ -125,17 +125,16 @@ class TestBaseDatasetWriter:
             mock_batch = MagicMock()
             fn(mock_batch)
             # make sure that the callback is called first, then the write sample
-            # and finally the update function
-            if with_sharding:
-                sharding_mock().callback.assert_called_once_with(mock_batch)
-                writer.write_batch_py.assert_called_once_with(sharding_mock().callback())
-                sharding_mock().update(writer.write_batch_py())
-            else:
-                writer.write_batch_py.assert_called_once_with(mock_batch)
+            # and finally the update function. The callback also opens the shard for the
+            # batch, so it runs for every strategy, including NONE.
+            sharding_mock().callback.assert_called_once_with(mock_batch)
+            writer.write_batch_py.assert_called_once_with(sharding_mock().callback())
+            sharding_mock().update(writer.write_batch_py())
 
-            # make sure the sharding initializers is called
+            # starting a worker must not open a shard - that only happens once a batch
+            # reaches the worker, so a worker without data leaves no empty shard behind
             init()
-            sharding_mock().initialize.assert_called_once()
+            sharding_mock().initialize.assert_not_called()
             writer.initialize.assert_called_once()
 
             # make sure the sharding finalizers is called

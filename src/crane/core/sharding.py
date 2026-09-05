@@ -8,8 +8,10 @@ efficient management of large datasets by dividing them into smaller, manageable
 
 import logging
 import multiprocessing as mp
+import uuid
 import warnings
 from collections import OrderedDict
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, TypeAlias, TypeVar
 
@@ -172,6 +174,34 @@ GET_BATCH_SIZE_FN_MAPPING: dict[
 }
 
 
+@dataclass
+class _OpenShard:
+    """The shard a process currently has open, and how much has gone into it.
+
+    Attributes:
+        shard_id (None | int): The id of the open shard, or None when none is open.
+        size (int): The size of the shard in the unit of the sharding strategy.
+        num_bytes (int): The number of bytes written to the shard.
+        batch_size (int): The size of the batch that is currently being written.
+    """
+
+    shard_id: None | int = None
+    size: int = 0
+    num_bytes: int = 0
+    batch_size: int = 0
+
+
+_OPEN_SHARDS: dict[str, _OpenShard] = {}
+"""The shard every controller has open in *this* process, keyed by the controller's uid.
+
+Kept out of the controller instances on purpose. A worker receives the controller twice -
+once with the worker initialization and finalization hooks, which travel with the process
+object, and once inside the write function, which the runner ships separately - so the two
+copies in a worker would otherwise disagree about which shard is open, and the copy that
+opened a shard would not be the one asked to close it.
+"""
+
+
 class ShardingController(object):
     """Controller responsible for managing dataset sharding during the writing process.
 
@@ -240,10 +270,9 @@ class ShardingController(object):
         self._max_shard_size = max_shard_size
         self._sample_size_key = sample_size_key
         # shard state
-        self._shard_id: None | int = None
-        self._shard_size = 0
-        self._shard_bytes = 0
-        self._batch_size = 0
+        # Identifies the controller across all of its copies, so every copy in a process
+        # looks up the same open shard. Assigned before any copy is made.
+        self._uid = uuid.uuid4().hex
         self._batch_size_fn = GET_BATCH_SIZE_FN_MAPPING.get(
             (formatting, sharding_strategy), _no_batch_size
         )
@@ -268,34 +297,40 @@ class ShardingController(object):
         """
         return self._sharding_strategy is not ShardingStrategy.NONE
 
+    @property
+    def _shard(self) -> _OpenShard:
+        """The shard this process currently has open, empty when there is none.
+
+        Returns:
+            _OpenShard: The open shard state of this process.
+        """
+        return _OPEN_SHARDS.setdefault(self._uid, _OpenShard())
+
     def _next_shard_id(self) -> None:
         """Assign the next shard ID.
 
         If multi-processing is enabled, this is done with thread-safe increments
         using locks; otherwise, the counter is incremented directly.
         """
-        assert self._shard_id is None
+        assert self._shard.shard_id is None
 
         if not self._is_multi_processed:
-            self._shard_id = self._num_shards
+            self._shard.shard_id = self._num_shards
             self._num_shards += 1
 
         else:
             with self._lock:
-                self._shard_id = self._num_shards.get()
-                self._num_shards.set(self._shard_id + 1)
+                self._shard.shard_id = self._num_shards.get()
+                self._num_shards.set(self._shard.shard_id + 1)
 
     def _reset_state(self) -> None:
-        """Reset the shard state variables for the next shard."""
-        self._shard_id = None
-        self._shard_size = 0
-        self._shard_bytes = 0
-        self._batch_size = 0
+        """Forget the shard this process had open, leaving no shard open."""
+        _OPEN_SHARDS.pop(self._uid, None)
 
     T = TypeVar("T", pa.Table, dict[str, list[Any]])
 
     def callback(self, batch: T | dict[str, list[Any]]) -> T:
-        """Process each batch before writing and check if a new shard is required.
+        """Process each batch before writing and open a shard for it if needed.
 
         Args:
             batch (pa.Table | dict[str, list[Any]]): The batch of samples.
@@ -303,11 +338,20 @@ class ShardingController(object):
         Returns:
             pa.Table | dict[str, list[Any]]: The batch, unchanged.
         """
-        self._batch_size = self._batch_size_fn(batch, self._sample_size_key)
+        self._shard.batch_size = self._batch_size_fn(batch, self._sample_size_key)
 
-        # check if shard is full
-        if self._shard_size >= self._max_shard_size:
-            # finalize current shard and initialize a new one
+        if self._shard.shard_id is None:
+            # The first batch that reaches this worker opens its shard. Opening it when the
+            # worker starts instead would leave an empty shard file behind for every worker
+            # the data never reaches, which a reader then sees as a zero-row data file.
+            self.initialize()
+
+        elif (
+            self.is_active
+            and (self._max_shard_size is not None)
+            and (self._shard.size >= self._max_shard_size)
+        ):
+            # the shard is full - close it and open the next one
             self.finalize()
             self.initialize()
 
@@ -320,11 +364,11 @@ class ShardingController(object):
             num_bytes (int): The number of bytes written to the current shard.
         """
         # udpate shard size according to the strategy
-        self._shard_bytes += num_bytes
-        self._shard_size += (
-            self._batch_size
+        self._shard.num_bytes += num_bytes
+        self._shard.size += (
+            self._shard.batch_size
             if self._sharding_strategy is ShardingStrategy.SAMPLE_COUNT
-            else self._batch_size
+            else self._shard.batch_size
             if self._sharding_strategy is ShardingStrategy.SAMPLE_ITEM
             else num_bytes
             if self._sharding_strategy is ShardingStrategy.FILE_SIZE
@@ -332,15 +376,19 @@ class ShardingController(object):
         )
 
     def initialize(self) -> None:
-        """Initialize a new shard by assigning an ID and invoking the initialization logic."""
+        """Open a new shard by assigning an ID and invoking the initialization logic.
+
+        Called from :func:`callback` for the first batch a worker writes and whenever the
+        current shard is full, so a shard only ever exists because there was data for it.
+        """
         # initialize new shard
         self._next_shard_id()
-        self._initialize_shard(self._shard_id)
-        logger.info(f"Initialized new shard with id {self._shard_id}.")
+        self._initialize_shard(self._shard.shard_id)
+        logger.info(f"Initialized new shard with id {self._shard.shard_id}.")
 
     def finalize(self) -> None:
         """Finalize the current shard, reset its state, and invoke the finalization logic."""
-        if self._shard_id is not None:
+        if self._shard.shard_id is not None:
             self._finalize_shard()
-            logger.info(f"Finalized shard with id {self._shard_id}")
+            logger.info(f"Finalized shard with id {self._shard.shard_id}")
             self._reset_state()
