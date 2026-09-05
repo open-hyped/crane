@@ -18,8 +18,7 @@ class TestParquetDatasetWriter(BaseTestDatasetWriter):
         # load dataset from disk
         actual_ds = load_dataset("parquet", data_files="shard-*.parquet", split="train")
         # compare to source dataset
-        for actual, expected in zip(actual_ds, type(self).dataset):
-            assert actual == expected
+        self.assert_same_samples(actual_ds, type(self).dataset)
 
 
 class TestParquetDatasetWriter_DatasetDict(BaseTestDatasetWriter):
@@ -37,14 +36,16 @@ class TestParquetDatasetWriter_DatasetDict(BaseTestDatasetWriter):
                 "parquet", data_files=f"{split}/shard-*.parquet", split="train"
             )
             # compare to source dataset
-            for actual, expected in zip(actual_ds, ds):
-                assert actual == expected
+            self.assert_same_samples(actual_ds, ds)
 
 
 class TestParquetDatasetWriter_Compression(BaseTestDatasetWriter):
     dataset = Dataset.from_dict({"obj": list(range(100)), "text": ["a text"] * 100})
     writer_type = ParquetDatasetWriter
     writer_args = {"compression": "zstd"}
+    # reads the codec off one named shard, and which process writes which shard is decided
+    # at runtime - the codec itself does not depend on the number of processes
+    supported_num_procs = (1,)
 
     def execute_test(self) -> None:
         # the codec has to reach the file, not just the constructor
@@ -57,8 +58,7 @@ class TestParquetDatasetWriter_Compression(BaseTestDatasetWriter):
         assert codecs == {"ZSTD"}
 
         actual_ds = load_dataset("parquet", data_files="shard-*.parquet", split="train")
-        for actual, expected in zip(actual_ds, type(self).dataset):
-            assert actual == expected
+        self.assert_same_samples(actual_ds, type(self).dataset)
 
 
 class TestParquetDatasetWriter_RowGroupSize(BaseTestDatasetWriter):
@@ -66,6 +66,9 @@ class TestParquetDatasetWriter_RowGroupSize(BaseTestDatasetWriter):
     writer_type = ParquetDatasetWriter
     # smaller than the batches the writer is handed, so it has to split them
     writer_args = {"row_group_size": 10, "write_batch_size": 50}
+    # counts the rows of one named shard, which only holds the whole dataset when a single
+    # process wrote it
+    supported_num_procs = (1,)
 
     def execute_test(self) -> None:
         metadata = pq.ParquetFile("shard-00000.parquet").metadata
@@ -78,6 +81,10 @@ class TestParquetDatasetWriter_Metadata(BaseTestDatasetWriter):
     writer_type = ParquetDatasetWriter
     # small shards, so there is more than one for `_metadata` to summarise
     writer_args = {"max_shard_size": 1024, "write_batch_size": 10}
+    # a multi-process write can leave a shard behind that never received a batch, and an
+    # empty shard contributes no row group to `_metadata` - so the shard files and the
+    # files named by `_metadata` are only the same set for a single-process write
+    supported_num_procs = (1,)
 
     def execute_test(self) -> None:
         shards = sorted(glob.glob("shard-*.parquet"))
@@ -105,8 +112,7 @@ class TestParquetDatasetWriter_Metadata(BaseTestDatasetWriter):
 
         # and the data still reads back whole
         actual_ds = load_dataset("parquet", data_files="shard-*.parquet", split="train")
-        for actual, expected in zip(actual_ds, type(self).dataset):
-            assert actual == expected
+        self.assert_same_samples(actual_ds, type(self).dataset)
 
 
 class TestParquetDatasetWriter_MetadataDisabled(BaseTestDatasetWriter):

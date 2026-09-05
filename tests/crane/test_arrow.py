@@ -13,8 +13,7 @@ class TestArrowDatasetWriter(BaseTestDatasetWriter):
         # load dataset from disk
         actual_ds = load_from_disk(".")
         # compare to source dataset
-        for actual, expected in zip(actual_ds, type(self).dataset):
-            assert actual == expected
+        self.assert_same_samples(actual_ds, type(self).dataset)
 
 
 class TestArrowDatasetWriter_DatasetDict(BaseTestDatasetWriter):
@@ -33,5 +32,4 @@ class TestArrowDatasetWriter_DatasetDict(BaseTestDatasetWriter):
         for split, ds in type(self).dataset.items():
             assert split in actual_ds
             # compare to source dataset
-            for actual, expected in zip(actual_ds[split], ds):
-                assert actual == expected
+            self.assert_same_samples(actual_ds[split], ds)

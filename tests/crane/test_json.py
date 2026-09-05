@@ -10,6 +10,9 @@ from .base import BaseTestDatasetWriter
 
 class BaseTestJsonDatasetWriter(BaseTestDatasetWriter):
     writer_type = JsonDatasetWriter
+    # a generator-backed dataset has no arrow iterable, which the multiprocessing runner
+    # requires, so these sources are single-process only
+    supported_num_procs = (1,)
 
     def execute_test(self) -> None:
         cls = type(self)
