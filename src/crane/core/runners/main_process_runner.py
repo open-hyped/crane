@@ -109,6 +109,11 @@ class MainProcessRunner(BaseRunner):
         monitor = ProgressMonitor(num_shards, 1, None, 0)
         self._failures = []
 
+        # bound up front: the finally block reports whatever is left over, and it runs even
+        # when the initialization below raises before the loop is ever entered
+        num_samples = 0
+        last_report = clock()
+
         try:
             # call start callback
             self._callback.on_start(monitor, ds)
@@ -120,7 +125,6 @@ class MainProcessRunner(BaseRunner):
             monitor._mark_worker_ready(0)
             monitor._mark_worker_idling(0)
 
-            num_samples = 0
             last_report = clock()
 
             for shard_id in range(num_shards):
@@ -246,8 +250,13 @@ class MainProcessRunner(BaseRunner):
                 logger.error(f"Error during worker finalization: {e}", exc_info=True)
 
             # stop worker
-            monitor._mark_worker_idling(0)
-            monitor._mark_worker_done(0)
+            # the worker is only marked alive once the initialization succeeded, and both
+            # marks assert on that. Guarding them keeps a failed initialization from raising
+            # out of the finally block, which would skip the reset below and leave the
+            # process-global worker info set for every later run in this process
+            if 0 in monitor.alive_workers:
+                monitor._mark_worker_idling(0)
+                monitor._mark_worker_done(0)
             # reset the worker info
             reset_worker_info()
             # stopping

@@ -7,6 +7,7 @@ from crane.core.callbacks.base import CallbackManager
 from crane.core.monitor import ProgressMonitor
 from crane.core.runners.base import FailurePolicy, ShardProcessingError
 from crane.core.runners.main_process_runner import MainProcessRunner
+from crane.core.worker import get_worker_info, reset_worker_info
 
 
 class TestMainProcessRunner:
@@ -26,6 +27,13 @@ class TestMainProcessRunner:
         ds = Dataset.from_dict(samples)
         ds = ds.to_iterable_dataset(1)
         return ds
+
+    @pytest.fixture(autouse=True)
+    def reset_worker_info_after_test(self):
+        """The worker info is process-global, so a run that fails before its own reset
+        would otherwise leak into every following test."""
+        yield
+        reset_worker_info()
 
     @pytest.fixture
     def runner(self):
@@ -88,3 +96,30 @@ class TestMainProcessRunner:
         # every shard was attempted, rather than stopping at the first
         assert len(excinfo.value.failures) == 3
         assert {f.shard_id for f in excinfo.value.failures} == {0, 1, 2}
+
+    def test_failing_env_init_is_not_masked_by_unbound_local(self, runner, ds, monitor):
+        # The finally block reports leftover samples, so it reads counters that used to be
+        # assigned only after a successful initialization - hiding the actual failure.
+        runner._env_init = MagicMock(side_effect=RuntimeError("env init failed"))
+
+        with pytest.raises(BaseException) as exc_info:
+            runner.run(ds, MagicMock())
+
+        assert not isinstance(exc_info.value, UnboundLocalError)
+
+    def test_failing_env_init_reports_its_own_error_and_resets_worker_info(
+        self, runner, ds, monitor
+    ):
+        # The worker is only alive once the initialization succeeded, so marking it in the
+        # finally block used to raise from there, skipping the reset of the process-global
+        # worker info and breaking every later run in the same process.
+        runner._env_init = MagicMock(side_effect=RuntimeError("env init failed"))
+
+        with pytest.raises(RuntimeError, match="env init failed"):
+            runner.run(ds, MagicMock())
+
+        assert get_worker_info() is None
+
+        # a second run is unaffected by the first one having failed
+        runner._env_init = MagicMock()
+        runner.run(ds, MagicMock())
