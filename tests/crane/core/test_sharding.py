@@ -250,6 +250,137 @@ class TestShardingController:
         finalize_shard.assert_called_once()
         initialize_shard.assert_called_once()
 
+    def test_no_shard_is_opened_without_a_batch(self):
+        initialize_shard = MagicMock()
+        finalize_shard = MagicMock()
+
+        controller = ShardingController(
+            is_multi_processed=False,
+            sharding_strategy=ShardingStrategy.FILE_SIZE,
+            max_shard_size=1024,
+            sample_size_key=None,
+            initialize_shard=initialize_shard,
+            finalize_shard=finalize_shard,
+            formatting=FormatType.PYTHON,
+        )
+
+        # the whole life of a worker the data never reached: it is started and finished
+        # without a single batch ever arriving
+        controller.finalize()
+
+        # so it must leave nothing behind - an opened shard here is an empty file in the
+        # written dataset, and one a parquet `_metadata` cannot even name. What used to
+        # open it is the writer asking for a shard when a worker starts, which
+        # `test_write_split` in test_writer.py is what pins down.
+        assert not initialize_shard.called
+        assert not finalize_shard.called
+
+    def test_first_batch_opens_the_shard(self):
+        initialize_shard = MagicMock()
+        finalize_shard = MagicMock()
+
+        controller = ShardingController(
+            is_multi_processed=False,
+            sharding_strategy=ShardingStrategy.SAMPLE_COUNT,
+            max_shard_size=1024,
+            sample_size_key=None,
+            initialize_shard=initialize_shard,
+            finalize_shard=finalize_shard,
+            formatting=FormatType.PYTHON,
+        )
+
+        controller.callback({"key": [42]})
+        controller.update(42)
+
+        initialize_shard.assert_called_once_with(0)
+        assert not finalize_shard.called
+
+        # the shard is nowhere near full, so the next batch goes into the same one
+        controller.callback({"key": [42]})
+        controller.update(42)
+
+        initialize_shard.assert_called_once()
+
+    def test_none_strategy_opens_one_shard_and_never_rolls_over(self):
+        initialize_shard = MagicMock()
+        finalize_shard = MagicMock()
+
+        controller = ShardingController(
+            is_multi_processed=False,
+            sharding_strategy=ShardingStrategy.NONE,
+            max_shard_size=None,
+            sample_size_key=None,
+            initialize_shard=initialize_shard,
+            finalize_shard=finalize_shard,
+            formatting=FormatType.PYTHON,
+        )
+
+        for _ in range(10):
+            controller.callback({"key": [42] * 100})
+            controller.update(4096)
+
+        # sharding is off, so everything goes into the one shard the first batch opened
+        initialize_shard.assert_called_once_with(0)
+        assert not finalize_shard.called
+
+        controller.finalize()
+        finalize_shard.assert_called_once()
+
+    def test_a_pickled_copy_shares_the_open_shard(self):
+        # A worker receives the controller twice - once with the process object and once
+        # pickled into the worker setup - so the copy that opens a shard is not the copy
+        # that is asked to close it. Both must mean the same shard.
+        _SHARD_CALLS.clear()
+
+        controller = ShardingController(
+            is_multi_processed=False,
+            sharding_strategy=ShardingStrategy.SAMPLE_COUNT,
+            max_shard_size=4,
+            sample_size_key=None,
+            initialize_shard=_record_initialize_shard,
+            finalize_shard=_record_finalize_shard,
+            formatting=FormatType.PYTHON,
+        )
+        copy = pickle.loads(pickle.dumps(controller))
+
+        # the copy inside the write function opens the shard
+        copy.callback({"key": [42]})
+        copy.update(42)
+        assert _SHARD_CALLS == [("initialize", 0)]
+
+        # the copy the worker was started with sees that same shard as open: it neither
+        # opens a second one for the next batch ...
+        controller.callback({"key": [42]})
+        controller.update(42)
+        assert _SHARD_CALLS == [("initialize", 0)]
+
+        # ... nor mistakes it for "nothing open" when the worker finishes, which would
+        # leave the shard the other copy opened unfinalized
+        controller.finalize()
+        assert _SHARD_CALLS == [("initialize", 0), ("finalize", None)]
+
+
+_SHARD_CALLS: list[tuple[str, None | int]] = []
+"""The shard hooks that were called, in order. Written by the two functions below.
+
+A module-level recorder rather than a mock: the hooks have to survive being pickled with
+the controller, and both copies must reach the same recorder.
+"""
+
+
+def _record_initialize_shard(shard_id: int) -> None:
+    """Record a shard being opened.
+
+    Args:
+        shard_id (int): The shard being opened.
+    """
+    _SHARD_CALLS.append(("initialize", shard_id))
+
+
+def _record_finalize_shard() -> None:
+    """Record the open shard being closed."""
+    _SHARD_CALLS.append(("finalize", None))
+
 
 def _noop_shard(shard_id: int) -> None:
     """Picklable stand-in for the shard initialization and finalization hooks.
