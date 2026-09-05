@@ -109,6 +109,11 @@ class MainProcessRunner(BaseRunner):
         monitor = ProgressMonitor(num_shards, 1, None, 0)
         self._failures = []
 
+        # bound up front: the finally block reports whatever is left over, and it runs even
+        # when the initialization below raises before the loop is ever entered
+        num_samples = 0
+        last_report = clock()
+
         try:
             # call start callback
             self._callback.on_start(monitor, ds)
@@ -120,7 +125,6 @@ class MainProcessRunner(BaseRunner):
             monitor._mark_worker_ready(0)
             monitor._mark_worker_idling(0)
 
-            num_samples = 0
             last_report = clock()
 
             for shard_id in range(num_shards):
