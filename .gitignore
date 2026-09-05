@@ -21,6 +21,10 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# `dist/` above is the packaging build directory. It also matches crane's own
+# `crane.dist` package, which must stay tracked.
+!src/crane/dist/
+!tests/crane/dist/
 downloads/
 eggs/
 .eggs/
