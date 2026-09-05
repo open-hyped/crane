@@ -636,3 +636,36 @@ class TestWorkerFailures:
             runner.run(ds.map(_raise_on_everything), SharedMock())
 
         assert len(excinfo.value.failures) <= 8, "the same shard is being retried"
+
+
+class TestNoDuplicateRows:
+    """A separable transform plus more than one process used to duplicate rows.
+
+    The controller switches a worker between writing and producing while it is part-way
+    through a shard, and the switch can land on the shard's last batch - after the stream
+    has already run out. Resuming there restarted the shard, so its rows were written once
+    by the worker that was switched away and once by the consumer that took over.
+
+    **Note**: this is an end-to-end check that the output is correct, not the guard against
+    that regression. Whether the switch lands on the last batch depends on timing, so this
+    passes even with the fault present. The deterministic guard is
+    :class:`TestStoppableExamplesIterable`, which asserts that an exhausted stream is never
+    read a second time.
+    """
+
+    @pytest.mark.parametrize("num_proc", [2, 4])
+    def test_a_mapped_dataset_is_written_exactly_once(self, num_proc, tmp_path):
+        from crane import ArrowDatasetWriter
+
+        rows = [{"shard": s, "value": s * 10 + i} for s in range(6) for i in range(10)]
+        ds = Dataset.from_list(rows).to_iterable_dataset(num_shards=6)
+        ds = ds.map(
+            lambda x: {"doubled": x["value"] * 2},
+            features=datasets.Features(dict(ds.features) | {"doubled": datasets.Value("int64")}),
+        )
+
+        out = str(tmp_path / "out")
+        ArrowDatasetWriter(out, overwrite=True, num_proc=num_proc, disable_tqdm=True).write(ds)
+
+        written = sorted(datasets.load_from_disk(out)["value"])
+        assert written == sorted(row["value"] for row in rows)

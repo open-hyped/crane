@@ -27,6 +27,41 @@ def ex_iterable() -> _BaseExamplesIterable:
     )
 
 
+class _RestartingArrowIterable(_BaseExamplesIterable):
+    """A source that starts from the beginning every time it is iterated.
+
+    The point of the fix is that :class:`StoppableExamplesIterable` must not ask its source
+    for a second pass once the first has run out. A source that counts its passes states
+    that directly, without depending on whether some other iterable happens to resume or
+    restart.
+    """
+
+    def __init__(self, tables: list) -> None:
+        super().__init__()
+        self.tables = tables
+        self.passes = 0
+
+    @property
+    def iter_arrow(self):
+        return self._iter_arrow
+
+    def _iter_arrow(self):
+        self.passes += 1
+        for i, table in enumerate(self.tables):
+            yield str(i), table
+
+    def __iter__(self):
+        for key, table in self._iter_arrow():
+            yield key, table.to_pylist()[0]
+
+    @property
+    def num_shards(self) -> int:
+        return 1
+
+    def _init_state_dict(self) -> dict:
+        self._state_dict = {}
+        return self._state_dict
+
 class TestStoppableExamplesIterable:
     def test_iter(self, ex_iterable) -> None:
         it = StoppableExamplesIterable(ex_iterable)
@@ -49,6 +84,48 @@ class TestStoppableExamplesIterable:
         # resume the iteration
         it.resume()
         assert len([x for x in it.iter_arrow()]) == 17
+
+
+    def test_an_exhausted_stream_is_not_read_again(self) -> None:
+        # A worker reuses one of these across role changes, and a change can land on the
+        # last batch of a shard - after the source has already run out. Restarting there
+        # reads the shard twice, and every one of its rows is written twice: once by the
+        # role that was left and once by the role that took over.
+        source = _RestartingArrowIterable([pa.table({"field": [i]}) for i in range(3)])
+        it = StoppableExamplesIterable(source)
+
+        assert len(list(it.iter_arrow())) == 3
+        assert source.passes == 1
+
+        it.stop()
+        it.resume()
+
+        assert list(it.iter_arrow()) == []
+        assert source.passes == 1, "the exhausted shard was read a second time"
+
+    def test_an_exhausted_stream_is_not_read_again_in_python_format(self) -> None:
+        source = _RestartingArrowIterable([pa.table({"field": [i]}) for i in range(3)])
+        it = StoppableExamplesIterable(source)
+
+        assert len(list(it)) == 3
+        it.stop()
+        it.resume()
+
+        assert list(it) == []
+        assert source.passes == 1, "the exhausted shard was read a second time"
+
+    def test_a_stop_part_way_through_still_resumes(self) -> None:
+        # the other half of the contract: stopping before the end must not lose the rest
+        source = _RestartingArrowIterable([pa.table({"field": [i]}) for i in range(4)])
+        it = StoppableExamplesIterable(source)
+
+        seen = list(islice(it.iter_arrow(), 2))
+        it.stop()
+        it.resume()
+        seen += list(it.iter_arrow())
+
+        assert len(seen) == 4
+        assert source.passes == 1
 
 
 class TestTimedExamplesIterable:

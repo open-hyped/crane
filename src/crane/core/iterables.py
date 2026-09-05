@@ -92,6 +92,7 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         """
         super(StoppableExamplesIterable, self).__init__(ex_iterable)
         self._flag = False
+        self._exhausted = False
         self._iter: None | Iterable[tuple[Key, pa.Table]] = None
 
     def init_iter(self) -> None:
@@ -100,11 +101,23 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         self._iter = self.ex_iterable.iter_arrow()
 
     def stop(self) -> None:
-        """Stop the iteration."""
+        """Stop the iteration.
+
+        Only pauses. A stopped stream carries on from where it left off when it is resumed;
+        a stream that has run out stays run out. See :func:`resume`.
+        """
         self._flag = True
 
     def resume(self) -> None:
-        """Resume the iteration."""
+        """Resume a stopped iteration.
+
+        Deliberately does not clear :attr:`_exhausted`. A worker reuses one of these across
+        role changes - it is stopped when the controller moves it between producing and
+        writing, and resumed as the new role starts - and the change can land on the last
+        batch of the stream, after the underlying iterator has already run out. Resuming
+        must not start the shard again there: the rows would be read a second time and
+        written twice, once by the role that was left and once by the role that took over.
+        """
         self._flag = False
 
     def __iter__(self) -> Iterable[tuple[Key, dict[str, Any]]]:
@@ -113,9 +126,6 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         Yields:
             tuple[key, dict[Key, Any]]: A tuple containing a key and the formatted example.
         """
-        if self._iter is None:
-            self.init_iter()
-
         formatter = PythonFormatter()
         for key, pa_table in self._iter_arrow():
             for i, item in enumerate(pa_table.to_reader(max_chunksize=1)):
@@ -131,6 +141,12 @@ class StoppableExamplesIterable(BaseExamplesIterable):
         Yields:
             tuple[Key, pa.Table]: A tuple containing a key and pyarrow table.
         """
+        # An exhausted stream yields nothing rather than starting again. Without this, the
+        # `self._iter is None` below cannot tell "not started yet" from "already finished",
+        # and reading the shard a second time duplicates every row in the output.
+        if self._exhausted:
+            return
+
         if self._iter is None:
             self.init_iter()
 
@@ -139,6 +155,7 @@ class StoppableExamplesIterable(BaseExamplesIterable):
                 yield next(self._iter)
         except StopIteration:
             self._iter = None
+            self._exhausted = True
 
 
 class TimedExamplesIterable(BaseExamplesIterable):
