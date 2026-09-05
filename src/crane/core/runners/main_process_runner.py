@@ -250,8 +250,13 @@ class MainProcessRunner(BaseRunner):
                 logger.error(f"Error during worker finalization: {e}", exc_info=True)
 
             # stop worker
-            monitor._mark_worker_idling(0)
-            monitor._mark_worker_done(0)
+            # the worker is only marked alive once the initialization succeeded, and both
+            # marks assert on that. Guarding them keeps a failed initialization from raising
+            # out of the finally block, which would skip the reset below and leave the
+            # process-global worker info set for every later run in this process
+            if 0 in monitor.alive_workers:
+                monitor._mark_worker_idling(0)
+                monitor._mark_worker_done(0)
             # reset the worker info
             reset_worker_info()
             # stopping

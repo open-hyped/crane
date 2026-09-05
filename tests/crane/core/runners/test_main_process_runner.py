@@ -7,7 +7,7 @@ from crane.core.callbacks.base import CallbackManager
 from crane.core.monitor import ProgressMonitor
 from crane.core.runners.base import FailurePolicy, ShardProcessingError
 from crane.core.runners.main_process_runner import MainProcessRunner
-from crane.core.worker import reset_worker_info
+from crane.core.worker import get_worker_info, reset_worker_info
 
 
 class TestMainProcessRunner:
@@ -106,3 +106,20 @@ class TestMainProcessRunner:
             runner.run(ds, MagicMock())
 
         assert not isinstance(exc_info.value, UnboundLocalError)
+
+    def test_failing_env_init_reports_its_own_error_and_resets_worker_info(
+        self, runner, ds, monitor
+    ):
+        # The worker is only alive once the initialization succeeded, so marking it in the
+        # finally block used to raise from there, skipping the reset of the process-global
+        # worker info and breaking every later run in the same process.
+        runner._env_init = MagicMock(side_effect=RuntimeError("env init failed"))
+
+        with pytest.raises(RuntimeError, match="env init failed"):
+            runner.run(ds, MagicMock())
+
+        assert get_worker_info() is None
+
+        # a second run is unaffected by the first one having failed
+        runner._env_init = MagicMock()
+        runner.run(ds, MagicMock())
