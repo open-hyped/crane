@@ -1,15 +1,15 @@
 import json
 import os
-from copy import deepcopy
 from unittest.mock import ANY, MagicMock, call, patch
 
 import datasets
-import pyarrow as pa
 import pytest
 from datasets import Dataset, IterableDataset, IterableDatasetDict
 
-from crane.core.batching import BatchBuffer
 from crane.core.utils import chdir
+from copy import deepcopy
+import pyarrow as pa
+from crane.core.batching import BatchBuffer
 from crane.core.worker import get_worker_info, reset_worker_info, set_worker_info
 from crane.core.writer import BaseDatasetWriter
 
@@ -19,12 +19,23 @@ class TestBaseDatasetWriter:
         with pytest.raises(TypeError):
             # no write format supported
             class MockDatasetWriter(BaseDatasetWriter):
+                SHARD_FILE_EXTENSION = "mock"
+                initialize = MagicMock()
+                finalize = MagicMock()
+                initialize_shard = MagicMock()
+                finalize_shard = MagicMock()
+
+        with pytest.raises(TypeError, match="SHARD_FILE_EXTENSION"):
+            # the base class names every shard, so a writer has to say what to call it
+            class MockDatasetWriter(BaseDatasetWriter):
+                write_batch_py = MagicMock()
                 initialize = MagicMock()
                 finalize = MagicMock()
                 initialize_shard = MagicMock()
                 finalize_shard = MagicMock()
 
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             write_batch_py = MagicMock()
             initialize = MagicMock()
             finalize = MagicMock()
@@ -35,6 +46,7 @@ class TestBaseDatasetWriter:
         assert len(MockDatasetWriter.SUPPORTED_FORMATS) == 1
 
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             write_batch_arrow = MagicMock()
             initialize = MagicMock()
             finalize = MagicMock()
@@ -45,6 +57,7 @@ class TestBaseDatasetWriter:
         assert len(MockDatasetWriter.SUPPORTED_FORMATS) == 1
 
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             write_batch_py = MagicMock()
             write_batch_arrow = MagicMock()
             initialize = MagicMock()
@@ -58,6 +71,7 @@ class TestBaseDatasetWriter:
 
     def test_get_write_fn(self) -> None:
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             write_batch_py = MagicMock()
             write_batch_arrow = MagicMock()
             initialize = MagicMock()
@@ -90,6 +104,7 @@ class TestBaseDatasetWriter:
         ds = ds.to_iterable_dataset(1)
 
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             write_batch_py = MagicMock()
             initialize = MagicMock()
             finalize = MagicMock()
@@ -174,17 +189,23 @@ class TestBaseDatasetWriter:
         ds._format_kwargs = {"key": 0}
 
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             initialize = MagicMock()
             write_batch_py = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()
 
-        with patch("crane.core.writer.BaseDatasetWriter._write_dataset") as write_split_mock:
+        with (
+            patch("crane.core.writer.BaseDatasetWriter._consume_dataset") as consume_mock,
+            patch("crane.core.writer.BaseDatasetWriter._finalize_split") as finalize_mock,
+        ):
             writer = MockDatasetWriter(save_dir=tmp_path, overwrite=path_exists)
             writer.write(ds)
 
-            write_split_mock.assert_called_once_with(ds, tmp_path)
+            # the shards, then the metadata that needs all of them to exist
+            consume_mock.assert_called_once_with(ANY, tmp_path, job_index=None, callbacks=[])
+            finalize_mock.assert_called_once_with(ANY, tmp_path)
 
     @pytest.mark.parametrize("path_exists", [True, False])
     def test_write_dataset_dict(self, path_exists, tmp_path):
@@ -195,20 +216,27 @@ class TestBaseDatasetWriter:
         ds = IterableDatasetDict({"train": ds, "test": ds})
 
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             initialize = MagicMock()
             write_batch_py = MagicMock()
             finalize = MagicMock()
             initialize_shard = MagicMock()
             finalize_shard = MagicMock()
 
-        with patch("crane.core.writer.BaseDatasetWriter._write_dataset") as write_split_mock:
+        with (
+            patch("crane.core.writer.BaseDatasetWriter._consume_dataset") as consume_mock,
+            patch("crane.core.writer.BaseDatasetWriter._finalize_split") as finalize_mock,
+        ):
             writer = MockDatasetWriter(save_dir=tmp_path, overwrite=path_exists)
             writer.write(ds)
 
-            write_split_mock.assert_has_calls(
-                [call(split, os.path.join(tmp_path, key)) for key, split in ds.items()],
-                any_order=True,
-            )
+            # every split is written, and every split is finalized
+            assert {c.args[1] for c in consume_mock.mock_calls if c.args} == {
+                os.path.join(tmp_path, key) for key in ds
+            }
+            assert {c.args[1] for c in finalize_mock.mock_calls if c.args} == {
+                os.path.join(tmp_path, key) for key in ds
+            }
 
         # check if dataset dict json exists in output directory
         assert datasets.config.DATASETDICT_JSON_FILENAME in os.listdir(tmp_path)
@@ -217,6 +245,7 @@ class TestBaseDatasetWriter:
         ds = Dataset.from_dict({"obj": [0]}).to_iterable_dataset(1)
 
         class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
             write_batch_py = MagicMock()
             initialize = MagicMock()
             finalize = MagicMock()
@@ -238,6 +267,49 @@ class TestBaseDatasetWriter:
                 state = json.load(f)
 
         assert [entry["filename"] for entry in state["_data_files"]] == shards
+
+
+class TestShardNaming:
+    @pytest.fixture(autouse=True)
+    def in_a_worker(self):
+        # opening a shard starts its buffer, which lives in the worker's context
+        reset_worker_info()
+        set_worker_info(rank=0, num_workers=1, seed=None)
+        yield
+        reset_worker_info()
+
+    @pytest.fixture
+    def writer_type(self):
+        class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
+            write_batch_py = MagicMock()
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        return MockDatasetWriter
+
+    def test_local_name_is_unchanged(self, writer_type, tmp_path):
+        # datasets already on disk keep their names
+        writer = writer_type(save_dir=str(tmp_path))
+        assert writer._shard_path(42) == "shard-00042.mock"
+
+    def test_distributed_name_carries_the_job_index(self, writer_type, tmp_path):
+        writer = writer_type(save_dir=str(tmp_path))
+        assert writer._shard_path(42, job_index=7) == "shard-007-00042.mock"
+
+    def test_jobs_cannot_collide_whatever_they_write(self, writer_type, tmp_path):
+        # every job numbers its own shards from zero; only the job index keeps them apart
+        writer = writer_type(save_dir=str(tmp_path))
+        names = {writer._shard_path(i, job_index=j) for j in range(4) for i in range(10)}
+        assert len(names) == 40
+
+    def test_the_writer_is_handed_a_path_not_an_id(self, writer_type, tmp_path):
+        writer = writer_type(save_dir=str(tmp_path))
+        info = MagicMock()
+
+        writer._open_shard(3, info=info, job_index=7)
+
+        writer.initialize_shard.assert_called_once_with("shard-007-00003.mock", info)
 
 
 class TestShardBufferOwnership:

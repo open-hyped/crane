@@ -22,24 +22,24 @@ class JsonDatasetWriter(BaseDatasetWriter):
     according to its rank.
     """
 
-    def initialize_shard(self, shard_id: int, info: DatasetInfo) -> None:
+    SHARD_FILE_EXTENSION = "json"
+
+    def initialize_shard(self, path: str, info: DatasetInfo) -> None:
         """Initialize the file for writing.
 
-        This method is called at the start of the dataset writing process and
-        creates a new JSON file specific to the worker's rank. The file is opened
-        in write-binary mode to store serialized JSON lines.
+        This method is called at the start of each shard and opens the file the base class
+        named, in exclusive write-binary mode, to store serialized JSON lines.
 
-        The file is named using the worker's rank, in the format "shard-<shard_id>.json".
         The working directory is set to the save directory during this method.
 
         Args:
-            shard_id (int): The id of the shard being initialized.
+            path (str): The file to write the shard to, relative to the save directory.
             info (DatasetInfo): Information about the dataset to be written, including metadata
                 and configuration details.
         """
         info = get_worker_info()
-        info.ctx.file_path = f"shard-{shard_id:05}.json"
-        info.ctx.file = open(info.ctx.file_path, "wb", buffering=0)
+        info.ctx.file_path = path
+        info.ctx.file = open(path, "xb", buffering=0)
 
     def write_batch_arrow(self, batch: pa.Table) -> int:
         """Write a batch of samples to the JSON file.

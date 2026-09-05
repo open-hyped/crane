@@ -14,7 +14,7 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import asdict
 from functools import partial
-from typing import Any, Callable, ClassVar, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, TypeAlias
 
 import datasets
 import pyarrow as pa
@@ -35,6 +35,10 @@ from .runners.base import FailurePolicy
 from .sharding import ShardingController, ShardingStrategy
 from .utils import Compose, FormatType, RunAll, chdir
 from .worker import get_worker_info
+
+if TYPE_CHECKING:  # pragma: not covered
+    from ..dist.core.base import DistributedBackend
+    from ..dist.core.run import DistributedRun
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +80,14 @@ class BaseDatasetWriter(ABC):
 
     SUPPORTED_FORMATS: ClassVar[dict[FormatType, Callable[[Any], int]]] = dict()
 
+    SHARD_FILE_EXTENSION: ClassVar[str] = ""
+    """The file extension shards are written with, without a leading dot.
+
+    Set by each writer. The rest of a shard's name belongs to the base class, so that a
+    distributed run can guarantee two jobs never write the same path; see
+    :func:`_shard_path`.
+    """
+
     def __init_subclass__(cls, **kwargs):
         """Check for supported formats."""
         super().__init_subclass__(**kwargs)
@@ -91,12 +103,16 @@ class BaseDatasetWriter(ABC):
                 f"`{cls.__name__}` must override at least one of "
                 "`write_batch_py` or `write_batch_arrow`."
             )
+        # The base class names every shard, so that the shards written by different jobs
+        # of a distributed run cannot collide; a writer only says what to call the file.
+        if not getattr(cls, "SHARD_FILE_EXTENSION", None):
+            raise TypeError(f"`{cls.__name__}` must set `SHARD_FILE_EXTENSION`.")
 
     def __init__(
         self,
         save_dir: str,
         overwrite: bool = False,
-        num_proc: int = mp.cpu_count(),
+        num_proc: None | int = None,
         prefetch_factor: int = 128,
         write_batch_size: int = 256,
         tqdm_update_interval: float = 0.5,
@@ -113,8 +129,9 @@ class BaseDatasetWriter(ABC):
             save_dir (str): Directory where the dataset will be saved.
             overwrite (bool): Whether to overwrite existing files in the save directory.
                 Defaults to False.
-            num_proc (int): Number of processes to use for dataset processing. Defaults
-                to the number of CPU cores.
+            num_proc (None | int): Number of processes to use for dataset processing.
+                Defaults to :code:`None`, which means the number of CPU cores locally, and
+                the cores the allocation reserved for a run started with :func:`submit`.
             prefetch_factor (int): Number of samples to prefetch for improved
                 performance. Defaults to 8.
             write_batch_size (int): The number of samples handed to the writer in one call,
@@ -164,22 +181,55 @@ class BaseDatasetWriter(ABC):
         self._callbacks = callbacks
         self._failure_policy = failure_policy
 
-    def _open_shard(self, shard_id: int, info: datasets.DatasetInfo) -> None:
-        """Start a shard, and the buffer that regroups what is written to it.
+    @property
+    def num_proc(self) -> int:
+        """The number of processes this writer uses, resolved.
 
-        The buffer belongs to the worker rather than to the writer, alongside the shard's
-        own file handle. A worker receives its own copy of the writer for writing and
-        another for finalizing - they travel to it separately - so a buffer held on the
-        writer would be filled by one copy and flushed by the other, which is to say never.
+        :code:`num_proc` is left unset by a caller who wants it to follow whatever the run
+        is given - the machine's cores locally, or the cores a distributed job reserved.
+        """
+        return self._num_proc if self._num_proc is not None else mp.cpu_count()
+
+    def _shard_path(self, shard_id: int, job_index: None | int = None) -> str:
+        """Build the file name of a new shard.
+
+        The name belongs to the base class rather than to the writer, because it is the
+        only place that knows whether the run is distributed. With the job index in the
+        name, the shards written into one directory by different jobs cannot collide
+        whatever a writer does with the path it is handed - a guarantee that a convention
+        about shard ids could not give, since the name would still be chosen downstream.
 
         Args:
-            shard_id (int): The id of the shard being opened.
+            shard_id (int): The id of the shard, counted within this process's run.
+            job_index (None | int): The index of the distributed job writing it, or None
+                for a local run, whose names are unchanged.
+
+        Returns:
+            str: The shard's file name, relative to the save directory.
+        """
+        ext = type(self).SHARD_FILE_EXTENSION
+        if job_index is None:
+            return f"shard-{shard_id:05}.{ext}"
+        return f"shard-{job_index:03}-{shard_id:05}.{ext}"
+
+    def _open_shard(
+        self, shard_id: int, info: datasets.DatasetInfo, job_index: None | int = None
+    ) -> None:
+        """Name the shard, then let the writer open it.
+
+        Bound to the :class:`ShardingController` in place of :func:`initialize_shard`, so
+        that the controller keeps calling a single-argument callable and the writer never
+        has to see a shard id at all.
+
+        Args:
+            shard_id (int): The id of the shard being initialized.
             info (datasets.DatasetInfo): Information about the dataset being written.
+            job_index (None | int): The distributed job writing it, if any.
         """
         worker = get_worker_info()
         worker.ctx.buffer = BatchBuffer(self._write_batch_size)
         worker.ctx.write_fn = None
-        self.initialize_shard(shard_id, info)
+        self.initialize_shard(self._shard_path(shard_id, job_index), info)
 
     def _close_shard(self, info: datasets.DatasetInfo) -> None:
         """Write whatever the buffer still holds, then let the writer close the shard.
@@ -310,15 +360,16 @@ class BaseDatasetWriter(ABC):
         write_fn = supported_formats[formatting]
         return formatting, write_fn.__get__(self, type(self))
 
-    def _write_dataset(
-        self, ds: datasets.IterableDataset | datasets.Dataset, save_dir: str
-    ) -> None:
-        """Write the single dataset split to the specified directory.
+    def _prepare_split(
+        self, ds: datasets.IterableDataset | datasets.Dataset
+    ) -> datasets.IterableDataset:
+        """Bring one split into the form the write path expects.
 
         Args:
-            ds (datasets.IterableDataset | datasets.Dataset): The dataset or iterable dataset to be
-                written.
-            save_dir (str): The directory where the split data will be saved.
+            ds (datasets.IterableDataset | datasets.Dataset): The split to prepare.
+
+        Returns:
+            datasets.IterableDataset: The split, as an iterable dataset.
         """
         if ds.info is None:
             warnings.warn(
@@ -331,8 +382,46 @@ class BaseDatasetWriter(ABC):
 
         # convert dataset to iterable dataset
         if isinstance(ds, datasets.Dataset):
-            ds = ds.to_iterable_dataset(self._num_proc)
+            ds = ds.to_iterable_dataset(self.num_proc)
 
+        return ds
+
+    def _iter_splits(self, ds: DatasetType) -> Iterator[tuple[datasets.IterableDataset, str]]:
+        """Walk the splits of a dataset, with the directory each is written to.
+
+        A plain dataset is one nameless split written into the save directory itself, which
+        is what keeps the rest of the write path from having to care which it was given.
+
+        Args:
+            ds (DatasetType): The dataset or dataset dictionary being written.
+
+        Yields:
+            tuple[datasets.IterableDataset, str]: Each split, and where it goes.
+        """
+        if isinstance(ds, (datasets.DatasetDict, datasets.IterableDatasetDict)):
+            for key, split in ds.items():
+                yield self._prepare_split(split), os.path.join(self.save_dir, key)
+        else:
+            yield self._prepare_split(ds), self.save_dir
+
+    def _consume_dataset(
+        self,
+        ds: datasets.IterableDataset,
+        save_dir: str,
+        job_index: None | int = None,
+        callbacks: list[Callback] = [],
+    ) -> None:
+        """Write the shards of a single dataset split, but none of its metadata.
+
+        Args:
+            ds (datasets.IterableDataset): The split to write.
+            save_dir (str): The directory the split's shards go into.
+            job_index (None | int): The index of the distributed job doing the writing, or
+                None for a local run. Only used to name the shards, so that the jobs of one
+                run cannot write the same file.
+            callbacks (list[Callback]): Extra callbacks for this run, on top of the
+                writer's own. A distributed job uses these to report its progress.
+        """
         formatting, write_fn = self._get_write_fn(ds)
         logger.info(
             f"Routing write operation to {formatting} implementation ({write_fn.__qualname__})."
@@ -340,11 +429,11 @@ class BaseDatasetWriter(ABC):
 
         # create sharding controller
         sharding_controller = ShardingController(
-            is_multi_processed=self._num_proc > 1,
+            is_multi_processed=self.num_proc > 1,
             sharding_strategy=self._sharding_strategy,
             max_shard_size=self._max_shard_size,
             sample_size_key=self._sample_size_key,
-            initialize_shard=partial(self._open_shard, info=ds.info),
+            initialize_shard=partial(self._open_shard, info=ds.info, job_index=job_index),
             finalize_shard=partial(self._close_shard, info=ds.info),
             formatting=formatting,
         )
@@ -358,13 +447,13 @@ class BaseDatasetWriter(ABC):
             sharding_controller.callback,
         )
 
-        logger.info(f"Writing dataset split {ds.split} to {os.getcwd()}.")
+        logger.info(f"Writing dataset split {ds.split} to {save_dir}.")
 
         os.makedirs(save_dir, exist_ok=True)
         with chdir(save_dir):
             # write dataset to directory
             consumer = DatasetConsumer(
-                num_proc=self._num_proc,
+                num_proc=self.num_proc,
                 prefetch_factor=self._prefetch,
                 # no shard is opened here: a worker that never receives data must not leave
                 # an empty shard file behind, so the controller opens one on first write
@@ -375,18 +464,46 @@ class BaseDatasetWriter(ABC):
                 ),
                 progress_report_interval=self._tqdm_update_interval,
                 disable_tqdm=self._disable_tqdm,
-                callbacks=self._callbacks,
+                callbacks=self._callbacks + list(callbacks),
                 failure_policy=self._failure_policy,
             )
             consumer.consume(
                 ds, finalizer=write_fn, batch_size=self._write_batch_size, formatting=formatting
             )
 
+    def _finalize_split(self, ds: datasets.IterableDataset, save_dir: str) -> None:
+        """Write the metadata of a single dataset split.
+
+        Separate from :func:`_consume_dataset` because every one of these needs a view of
+        the finished split that no single writer process has: :func:`_write_state` lists
+        the directory, and :func:`finalize_dataset` may read every shard back. In a
+        distributed run they are therefore done once, afterwards, by the finalize job.
+
+        Args:
+            ds (datasets.IterableDataset): The split that was written.
+            save_dir (str): The directory its shards went into.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        with chdir(save_dir):
             # write dataset info and state
             self._write_state(ds)
             self._write_info(ds)
             # give the writer a look at the finished dataset as a whole
             self.finalize_dataset(ds)
+
+    def _write_dataset(
+        self, ds: datasets.IterableDataset | datasets.Dataset, save_dir: str
+    ) -> None:
+        """Write a single dataset split, shards and metadata alike.
+
+        Args:
+            ds (datasets.IterableDataset | datasets.Dataset): The dataset or iterable dataset to be
+                written.
+            save_dir (str): The directory where the split data will be saved.
+        """
+        ds = self._prepare_split(ds)
+        self._consume_dataset(ds, save_dir)
+        self._finalize_split(ds, save_dir)
 
     def finalize_dataset(self, ds: datasets.IterableDataset) -> None:
         """Called once after every shard of a split has been written.
@@ -408,8 +525,61 @@ class BaseDatasetWriter(ABC):
     def write(self, ds: DatasetType) -> None:
         """Write the entire dataset or dataset dictionary to disk.
 
+        Blocks until the dataset is written. To spread the same write across a cluster
+        instead, see :func:`submit`.
+
         Args:
             ds (DatasetType): The dataset or dataset dictionary to be written.
+        """
+        self._prepare_save_dir()
+        self._write_splits(ds)
+        self._finalize_splits(ds)
+
+    def submit(self, ds: DatasetType, *, on: "DistributedBackend") -> "DistributedRun":
+        """Write the dataset on a cluster, without waiting for it to finish.
+
+        The dataset's shards are split across :code:`on.num_jobs` jobs, each writing its
+        share with the same runner a local write uses, followed by one job that writes the
+        metadata once every other job has succeeded.
+
+        Unlike :func:`write`, this returns as soon as the work is queued. The dataset is
+        not written yet and is not loadable until the returned run reports that it is:
+
+        .. code-block:: python
+
+            run = writer.submit(ds, on=Slurm(num_jobs=16, partition="cpu"))
+            run.wait()
+
+        Args:
+            ds (DatasetType): The dataset or dataset dictionary to be written.
+            on (DistributedBackend): Where to run.
+
+        Returns:
+            DistributedRun: A handle on the submitted run.
+        """
+        # Imported here rather than at module scope so that the write path stays usable
+        # without the distributed stack, and to keep `crane.dist` free to import from
+        # `crane.core`.
+        from ..dist.core.run import submit as submit_run
+
+        self._prepare_save_dir()
+        return submit_run(
+            ds=ds,
+            target=self,
+            backend=on,
+            save_dir=self.save_dir,
+            needs_finalize=True,
+        )
+
+    def _prepare_save_dir(self) -> None:
+        """Create the output directory, honouring :code:`overwrite`.
+
+        Separate from :func:`write` because a distributed run does this exactly once, on
+        the submitting side: a job that ran it would delete the shards its siblings had
+        already written.
+
+        Raises:
+            FileExistsError: If the directory exists and :code:`overwrite` is not set.
         """
         # check if save directory already exists
         if os.path.exists(self.save_dir):
@@ -420,25 +590,54 @@ class BaseDatasetWriter(ABC):
                 )
             else:
                 # delete existing directory
-                logger.info("Deleting existing directory: {self.save_dir}.")
+                logger.info(f"Deleting existing directory: {self.save_dir}.")
                 shutil.rmtree(self.save_dir)
 
         # create the save directory
         os.makedirs(self.save_dir, exist_ok=False)
 
+    def _write_splits(
+        self,
+        ds: DatasetType,
+        job_index: None | int = None,
+        num_jobs: int = 1,
+        callbacks: list[Callback] = [],
+    ) -> None:
+        """Write the shards of every split, but none of the metadata.
+
+        Args:
+            ds (DatasetType): The dataset or dataset dictionary to be written.
+            job_index (None | int): The index of the distributed job doing the writing, or
+                None for a local run.
+            num_jobs (int): How many jobs the run is split across. Every split is divided
+                the same way, so a job takes its share of each.
+            callbacks (list[Callback]): Extra callbacks for this run, on top of the
+                writer's own.
+        """
+        for split, save_dir in self._iter_splits(ds):
+            if job_index is not None:
+                # Imported lazily; see `submit`.
+                from ..dist.core.partition import select_shards
+
+                split = select_shards(split, num_jobs, job_index)
+
+            self._consume_dataset(split, save_dir, job_index=job_index, callbacks=callbacks)
+
+    def _finalize_splits(self, ds: DatasetType) -> None:
+        """Write the metadata of every split, once all of their shards exist.
+
+        Args:
+            ds (DatasetType): The dataset or dataset dictionary that was written.
+        """
+        for split, save_dir in self._iter_splits(ds):
+            self._finalize_split(split, save_dir)
+
         if isinstance(ds, (datasets.DatasetDict, datasets.IterableDatasetDict)):
-            # write all splits
-            for key, split in ds.items():
-                self._write_dataset(split, os.path.join(self.save_dir, key))
             # write dataset splits json
             with open(
                 os.path.join(self.save_dir, datasets.config.DATASETDICT_JSON_FILENAME), "w+"
             ) as f:
                 f.write(json.dumps({"splits": list(ds.keys())}))
-
-        else:
-            # save dataset to directory
-            self._write_dataset(ds, self.save_dir)
 
     def write_batch_py(self, batch: dict[str, list[Any]]) -> int:
         """Abstract method for writing a batch of samples in Python-native format.
@@ -506,15 +705,24 @@ class BaseDatasetWriter(ABC):
         return  # pragma: not covered
 
     @abstractmethod
-    def initialize_shard(self, shard_id: int, info: datasets.DatasetInfo) -> None:
+    def initialize_shard(self, path: str, info: datasets.DatasetInfo) -> None:
         """Abstract method for initializing the write process for a new shard.
 
-        Any setup tasks specific to writing a new shard, such as creating necessary files or folders
-        for the shard, should take place here. The working directory is temporarily set to the save
-        directory during this method.
+        Open :code:`path` and set up whatever the format needs in order to write into it.
+        The working directory is temporarily set to the save directory during this method,
+        so the path is relative to it.
+
+        The name is chosen by the base class rather than here, so that the shards written
+        by the jobs of a distributed run cannot collide; see :func:`_shard_path`. A writer
+        needing more than one file per shard should derive the others from this path, for
+        the same reason it does not choose this one.
+
+        Prefer opening with :code:`"xb"` over :code:`"wb"`: nothing should ever be writing
+        over an existing shard, and exclusive creation turns a silent overwrite into an
+        immediate error.
 
         Args:
-            shard_id (int): The id of the shard being initialized.
+            path (str): The file to write the shard to, relative to the save directory.
             info (DatasetInfo): Information about the dataset to be written, including metadata
                 and configuration details.
         """

@@ -30,25 +30,27 @@ class ArrowDatasetWriter(BaseDatasetWriter):
         ds = datasets.load_from_disk("./data")
     """
 
-    def initialize_shard(self, shard_id: int, info: DatasetInfo) -> None:
+    SHARD_FILE_EXTENSION = "arrow"
+
+    def initialize_shard(self, path: str, info: DatasetInfo) -> None:
         """Initialize a new Arrow writer shard.
 
         This method sets up the Arrow file writer for the current shard by:
-        - Creating a shard file named :code:`shard-<shard_id>.arrow` for the current worker.
+        - Opening the shard file the base class named.
         - Converting dataset features to an Arrow schema.
         - Initializing the Arrow writer to stream data in Arrow format.
 
         The working directory is set to the save directory during the write process.
 
         Args:
-            shard_id (int): The id of the shard being initialized.
+            path (str): The file to write the shard to, relative to the save directory.
             info (DatasetInfo): Information about the dataset to be written, including metadata
                 and configuration details.
         """
         worker_info = get_worker_info()
         # open shard file
-        worker_info.ctx.file_path = f"shard-{shard_id:05}.arrow"
-        worker_info.ctx.file = open(worker_info.ctx.file_path, "wb", buffering=0)
+        worker_info.ctx.file_path = path
+        worker_info.ctx.file = open(path, "xb", buffering=0)
         # build arrow schema from dataset features
         assert info.features is not None
         worker_info.ctx.schema = info.features.arrow_schema
