@@ -81,10 +81,6 @@ class TestParquetDatasetWriter_Metadata(BaseTestDatasetWriter):
     writer_type = ParquetDatasetWriter
     # small shards, so there is more than one for `_metadata` to summarise
     writer_args = {"max_shard_size": 1024, "write_batch_size": 10}
-    # a multi-process write can leave a shard behind that never received a batch, and an
-    # empty shard contributes no row group to `_metadata` - so the shard files and the
-    # files named by `_metadata` are only the same set for a single-process write
-    supported_num_procs = (1,)
 
     def execute_test(self) -> None:
         shards = sorted(glob.glob("shard-*.parquet"))
@@ -141,3 +137,20 @@ class TestParquetDatasetWriter_MetadataForDatasetDict(BaseTestDatasetWriter):
         for split, ds in type(self).dataset.items():
             metadata = pq.read_metadata(os.path.join(split, "_metadata"))
             assert metadata.num_rows == len(ds)
+
+
+class TestParquetDatasetWriter_NoEmptyShards(BaseTestDatasetWriter):
+    # a single source shard, so with two processes there is nothing for the second one to
+    # do - it must not leave a shard behind for the data that never reached it
+    dataset = Dataset.from_dict({"obj": list(range(100))}).to_iterable_dataset(1)
+    writer_type = ParquetDatasetWriter
+    # small shards, so the run rolls over a few times on top of the shard it opens first
+    writer_args = {"max_shard_size": 1024, "write_batch_size": 10}
+    supported_num_procs = (2,)
+
+    def execute_test(self) -> None:
+        shards = sorted(glob.glob("shard-*.parquet"))
+        assert shards, "the test needs at least one shard to be meaningful"
+
+        empty = [shard for shard in shards if pq.read_metadata(shard).num_rows == 0]
+        assert not empty, f"shards were written without a single row in them: {empty}"
