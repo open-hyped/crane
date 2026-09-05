@@ -7,8 +7,9 @@ is what happened: it once checked only that each expected call was present, and 
 made the runner write every row of a shard twice passed the whole suite.
 """
 
-import pytest
 from unittest.mock import call
+
+import pytest
 
 from tests.third_party.sharedmock.asserters import assert_calls_equal_unsorted
 
@@ -38,6 +39,4 @@ class TestAssertCallsEqualUnsorted:
     def test_rejects_unhashable_arguments_being_repeated(self):
         # samples are dicts, so the calls cannot be counted with a `Counter`
         with pytest.raises(AssertionError):
-            assert_calls_equal_unsorted(
-                [call({"a": 1})], [call({"a": 1}), call({"a": 1})]
-            )
+            assert_calls_equal_unsorted([call({"a": 1})], [call({"a": 1}), call({"a": 1})])

@@ -62,6 +62,7 @@ class _RestartingArrowIterable(_BaseExamplesIterable):
         self._state_dict = {}
         return self._state_dict
 
+
 class TestStoppableExamplesIterable:
     def test_iter(self, ex_iterable) -> None:
         it = StoppableExamplesIterable(ex_iterable)
@@ -84,7 +85,6 @@ class TestStoppableExamplesIterable:
         # resume the iteration
         it.resume()
         assert len([x for x in it.iter_arrow()]) == 17
-
 
     def test_an_exhausted_stream_is_not_read_again(self) -> None:
         # A worker reuses one of these across role changes, and a change can land on the
