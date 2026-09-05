@@ -121,6 +121,14 @@ class RunSpec:
     backend: dict[str, Any]
     """The backend, as :func:`DistributedBackend.to_dict` rendered it."""
 
+    failure_policy: str = "fail_fast"
+    """What the run does when the workload raises on a shard.
+
+    Taken from the writer or consumer that was submitted. Recorded here because the decision
+    it drives - whether the other jobs carry on - belongs to the handle watching the run, and
+    the handle has only the spec to go on.
+    """
+
     job_ids: list[str] = field(default_factory=list)
     """The backend's own job ids, written once the run has been submitted.
 

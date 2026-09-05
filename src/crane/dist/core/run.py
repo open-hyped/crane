@@ -22,7 +22,7 @@ from datasets import IterableDataset
 from tqdm.auto import tqdm
 
 from ...__version__ import __version__
-from ...core.runners.base import ShardFailure, ShardProcessingError
+from ...core.runners.base import FailurePolicy, ShardFailure, ShardProcessingError
 from . import payload
 from .base import SPEC_FILENAME, DistributedBackend, JobState, RunSpec, RunState, RunStatus
 from .partition import num_jobs_for
@@ -93,6 +93,11 @@ class DistributedRun(object):
     def num_jobs(self) -> int:
         """How many worker jobs the run was split across."""
         return self._spec.num_jobs
+
+    @property
+    def failure_policy(self) -> FailurePolicy:
+        """What this run does when the workload raises on a shard."""
+        return FailurePolicy(self._spec.failure_policy)
 
     @property
     def job_ids(self) -> list[str]:
@@ -188,9 +193,22 @@ class DistributedRun(object):
             TimeoutError: If :code:`timeout` passed while the run was still going.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        # What had gone wrong at the moment the run was stopped, if it was. Kept because
+        # cancelling the siblings makes them look lost too, and reporting the jobs this
+        # handle killed alongside the one that actually failed would bury the real fault.
+        stopped_on: None | RunStatus = None
 
         while True:
             status = self.status()
+
+            if (stopped_on is None) and self._should_stop_the_rest(status):
+                logger.error(
+                    f"Run {self.run_id} failed on {len(status.failures)} shard(s) and the "
+                    f"failure policy is {self.failure_policy.value}; stopping the "
+                    f"remaining jobs."
+                )
+                stopped_on = status
+                self.cancel()
 
             if status.state in (RunState.COMPLETED, RunState.FAILED):
                 break
@@ -202,6 +220,10 @@ class DistributedRun(object):
                 )
 
             time.sleep(poll_interval)
+
+        # A run that was stopped is reported as it was when the decision was taken, not as
+        # it looks afterwards.
+        status = stopped_on if stopped_on is not None else status
 
         if status.failures:
             # The same error a local run raises, with the same contents: every failure the
@@ -215,6 +237,34 @@ class DistributedRun(object):
                 f"outside it, such as the walltime, a preemption or an out-of-memory kill. "
                 f"See `run.logs(job_index)`."
             )
+
+    def _should_stop_the_rest(self, status: RunStatus) -> bool:
+        """Whether a failure means the jobs still running should be stopped.
+
+        :attr:`FailurePolicy.FAIL_FAST` says a run whose workload raised has not produced
+        the dataset that was asked for, so there is nothing to be gained by letting the rest
+        of the cluster keep working on it. Locally the runner stops its own workers; the
+        jobs of a distributed run have no such connection to each other, and stopping them
+        is the handle's to do.
+
+        :attr:`FailurePolicy.SKIP_SHARD` means the opposite - the failed shards are expected
+        losses - so the other jobs carry on.
+
+        **Note**: this only happens while something is watching. A run left alone after
+        :func:`submit` keeps going until its jobs finish on their own.
+
+        Args:
+            status (RunStatus): The snapshot to judge.
+
+        Returns:
+            bool: Whether to cancel the run.
+        """
+        if self.failure_policy is not FailurePolicy.FAIL_FAST:
+            return False
+
+        # A lost job is not counted here: it is not the workload failing, and a run that
+        # loses one job to a preemption may still be worth letting finish.
+        return bool(status.failures)
 
     def watch(self, poll_interval: float = 1.0) -> None:
         """Follow the run with a progress bar, until it finishes.
@@ -342,6 +392,9 @@ def submit(
         # dataset was built in rather than whatever python the compute node happens to have.
         python=sys.executable,
         needs_finalize=needs_finalize,
+        # A writer and a consumer both carry one; a target that somehow does not gets the
+        # same default they do.
+        failure_policy=getattr(target, "_failure_policy", FailurePolicy.FAIL_FAST).value,
         backend=backend.to_dict(),
         crane_version=__version__,
     )

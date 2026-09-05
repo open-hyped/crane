@@ -19,6 +19,7 @@ class _FakeBackend(DistributedBackend):
     num_jobs: int = 2
     active: dict = field(default_factory=dict)
     finalize_pending: bool = False
+    cancelled: list = field(default_factory=list)
 
     def submit(self, spec):
         return ["1"]
@@ -30,7 +31,9 @@ class _FakeBackend(DistributedBackend):
         )
 
     def cancel(self, spec, job_ids):
-        pass
+        self.cancelled.append(list(job_ids))
+        # a cancelled job leaves the queue, which is what lets `wait` finish
+        self.active.clear()
 
 
 def _failure(rank: int, shard_id: int) -> dict:
@@ -57,6 +60,7 @@ def spec(tmp_path) -> RunSpec:
         python="/usr/bin/python",
         needs_finalize=True,
         backend={"name": "fake-for-tests"},
+        failure_policy="fail_fast",
         job_ids=["1"],
     )
     spec.save()
@@ -158,6 +162,66 @@ class TestWait:
         run = _run(spec, active={0: "running", 1: "running"})
         with pytest.raises(TimeoutError, match="has not been cancelled"):
             run.wait(timeout=0.05, poll_interval=0.01)
+
+
+class TestStopTheRestOnFailure:
+    """Under fail-fast the handle stops the jobs that are still running.
+
+    Locally the runner stops its own workers on the first failure. The jobs of a distributed
+    run have no connection to each other, so nothing does it unless the handle does.
+    """
+
+    def test_a_failure_stops_the_jobs_still_running(self, spec):
+        _report(spec, 0, failures=[_failure(0, 2)])
+        run = _run(spec, active={1: "running"})
+
+        # bounded, so that a run which is never stopped fails the test rather than
+        # hanging the suite; stopping it correctly returns in milliseconds
+        with pytest.raises(ShardProcessingError):
+            run.wait(timeout=5, poll_interval=0.01)
+
+        assert run._backend.cancelled == [["1"]], "the remaining jobs were left running"
+
+    def test_the_real_failure_is_reported_not_the_jobs_we_killed(self, spec):
+        # cancelling makes the siblings look lost; the workload failure is the fault
+        _report(spec, 0, failures=[_failure(0, 2)])
+        run = _run(spec, active={1: "running"})
+
+        with pytest.raises(ShardProcessingError) as info:
+            run.wait(timeout=5, poll_interval=0.01)
+
+        assert [f.shard_id for f in info.value.failures] == [2]
+
+    def test_the_run_is_stopped_only_once(self, spec):
+        _report(spec, 0, failures=[_failure(0, 2)])
+        run = _run(spec, active={1: "running"})
+
+        with pytest.raises(ShardProcessingError):
+            run.wait(timeout=5, poll_interval=0.01)
+
+        assert len(run._backend.cancelled) == 1
+
+    def test_skip_shard_lets_the_other_jobs_carry_on(self, spec):
+        spec = RunSpec(**(spec.__dict__ | {"failure_policy": "skip_shard"}))
+        spec.save()
+        _report(spec, 0, failures=[_failure(0, 2)])
+        _report(spec, 1)
+        run = _run(spec)
+
+        with pytest.raises(ShardProcessingError):
+            run.wait(poll_interval=0.01)
+
+        assert run._backend.cancelled == [], "a skipped shard should not stop the run"
+
+    def test_a_lost_job_alone_does_not_stop_the_run(self, spec):
+        # a preemption is not the workload failing, and the rest may still be worth finishing
+        run = _run(spec, active={1: "running"})
+        assert run.status().lost_jobs == [0], "the test needs a job that vanished"
+
+        with pytest.raises(TimeoutError):
+            run.wait(timeout=0.05, poll_interval=0.01)
+
+        assert run._backend.cancelled == []
 
 
 class TestLogs:
