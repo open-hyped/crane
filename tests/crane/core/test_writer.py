@@ -1,3 +1,4 @@
+import json
 import os
 from unittest.mock import ANY, MagicMock, call, patch
 
@@ -5,6 +6,7 @@ import datasets
 import pytest
 from datasets import Dataset, IterableDataset, IterableDatasetDict
 
+from crane.core.utils import chdir
 from crane.core.writer import BaseDatasetWriter
 
 
@@ -194,3 +196,29 @@ class TestBaseDatasetWriter:
 
         # check if dataset dict json exists in output directory
         assert datasets.config.DATASETDICT_JSON_FILENAME in os.listdir(tmp_path)
+
+    def test_write_state_lists_sorted_files_only(self, tmp_path):
+        ds = Dataset.from_dict({"obj": [0]}).to_iterable_dataset(1)
+
+        class MockDatasetWriter(BaseDatasetWriter):
+            write_batch_py = MagicMock()
+            initialize = MagicMock()
+            finalize = MagicMock()
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        writer = MockDatasetWriter(save_dir=tmp_path, overwrite=True, num_proc=1)
+
+        # written in reverse so a filesystem that reports creation order is caught as well
+        shards = [f"shard-{i:05d}.arrow" for i in range(20)]
+        for shard in reversed(shards):
+            (tmp_path / shard).touch()
+        (tmp_path / "working-dir").mkdir()
+
+        with chdir(tmp_path):
+            writer._write_state(ds)
+
+            with open(datasets.config.DATASET_STATE_JSON_FILENAME, encoding="utf-8") as f:
+                state = json.load(f)
+
+        assert [entry["filename"] for entry in state["_data_files"]] == shards

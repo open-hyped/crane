@@ -187,7 +187,12 @@ class BaseDatasetWriter(ABC):
         state = {key: getattr(ds, key, None) for key in keys}
         state["_format_kwargs"] = {}
         state["_split"] = str(ds.split) if ds.split is not None else ds.split
-        state["_data_files"] = [{"filename": fname} for fname in os.listdir(".")]
+        # sorted, so the shards are listed in their numbering rather than in whatever order
+        # the filesystem happens to report, and files only, so a working directory left in
+        # the save directory is not mistaken for a shard
+        state["_data_files"] = [
+            {"filename": fname} for fname in sorted(os.listdir(".")) if os.path.isfile(fname)
+        ]
 
         # write state to directory
         with open(datasets.config.DATASET_STATE_JSON_FILENAME, "w", encoding="utf-8") as state_file:
