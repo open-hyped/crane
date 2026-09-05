@@ -7,7 +7,13 @@ import pytest
 
 from crane.core.runners.base import ShardProcessingError
 from crane.distributed.core.base import BackendView, DistributedBackend, JobState, RunSpec, RunState
-from crane.distributed.core.run import DistributedRun, JobLostError, RunNotFoundError, attach
+from crane.distributed.core.run import (
+    DistributedRun,
+    JobFailedError,
+    JobLostError,
+    RunNotFoundError,
+    attach,
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,16 @@ def _report(spec: RunSpec, job_index: int, failures: list = []) -> None:
         json.dump({"job_index": job_index, "failures": failures, "error": None}, f)
 
 
+def _report_error(spec: RunSpec, job_index: int, error: str) -> None:
+    with open(spec.job_result_path(job_index), "w") as f:
+        json.dump({"job_index": job_index, "failures": [], "error": error}, f)
+
+
+def _report_finalize(spec: RunSpec, error: None | str = None) -> None:
+    with open(spec.finalize_result_path, "w") as f:
+        json.dump({"error": error}, f)
+
+
 def _mark_shards(spec: RunSpec, job_index: int, count: int) -> None:
     for shard_id in range(count):
         with open(spec.shard_marker_path(job_index, shard_id), "w"):
@@ -100,6 +116,7 @@ class TestStatus:
     def test_completed_once_the_metadata_is_written(self, spec):
         _report(spec, 0)
         _report(spec, 1)
+        _report_finalize(spec)
         assert _run(spec).status().state is RunState.COMPLETED
 
     def test_counts_shards_across_every_job(self, spec):
@@ -141,6 +158,7 @@ class TestWait:
     def test_returns_quietly_on_success(self, spec):
         _report(spec, 0)
         _report(spec, 1)
+        _report_finalize(spec)
         _run(spec).wait(poll_interval=0.01)
 
     def test_raises_the_same_error_a_local_run_raises(self, spec):
@@ -271,6 +289,7 @@ class TestAttach:
     def test_attached_handle_reads_the_same_state(self, spec):
         _report(spec, 0)
         _report(spec, 1)
+        _report_finalize(spec)
         assert attach(spec.run_dir).status().state is RunState.COMPLETED
 
 
@@ -298,3 +317,105 @@ class TestRunId:
 
         # a resubmission must not collide with the run it repeats
         assert _make_run_id(None, "/out") != _make_run_id(None, "/out")
+
+
+class TestJobsThatFailedBeforeAnyShard:
+    """A job that died in setup reported no shard failures, and none of its shards exist.
+
+    Reported through :attr:`RunStatus.errors` rather than :attr:`failures`, because there
+    is no shard to blame and the whole of that job's share of the dataset is missing.
+    """
+
+    def test_the_job_is_failed_not_completed(self, spec):
+        _report(spec, 0)
+        _report_error(spec, 1, "Traceback...\nRuntimeError: no such file\n")
+
+        status = _run(spec).status()
+
+        assert status.jobs == {0: JobState.COMPLETED, 1: JobState.FAILED}
+        assert status.state is RunState.FAILED
+
+    def test_the_traceback_is_carried_by_job(self, spec):
+        _report(spec, 0)
+        _report_error(spec, 1, "Traceback...\nRuntimeError: no such file\n")
+
+        status = _run(spec).status()
+
+        assert list(status.errors) == [1]
+        assert "no such file" in status.errors[1]
+        assert status.failures == []
+
+    def test_wait_raises_rather_than_returning_an_incomplete_dataset(self, spec):
+        _report(spec, 0)
+        _report_error(spec, 1, "Traceback...\nRuntimeError: no such file\n")
+
+        with pytest.raises(JobFailedError, match="no such file"):
+            _run(spec).wait(poll_interval=0.01)
+
+    def test_it_stops_the_jobs_still_running(self, spec):
+        # a whole job's shards are missing, so there is nothing for the siblings to finish
+        _report_error(spec, 0, "Traceback...\nRuntimeError: no such file\n")
+        run = _run(spec, active={1: "running"})
+
+        with pytest.raises(JobFailedError):
+            run.wait(poll_interval=0.01)
+
+        assert run._backend.cancelled == [["1"]]
+
+
+class TestFinalizeJob:
+    """Shards alone are not a dataset: it does not load until the metadata is written."""
+
+    def test_a_finalize_job_that_vanished_is_not_a_completed_run(self, spec):
+        _report(spec, 0)
+        _report(spec, 1)
+
+        status = _run(spec).status()
+
+        assert status.state is RunState.FAILED
+        assert "never written" in status.finalize_error
+
+    def test_a_finalize_job_that_failed_is_not_a_completed_run(self, spec):
+        _report(spec, 0)
+        _report(spec, 1)
+        _report_finalize(spec, error="Traceback...\nOSError: disk full\n")
+
+        status = _run(spec).status()
+
+        assert status.state is RunState.FAILED
+        assert "disk full" in status.finalize_error
+
+    def test_wait_raises_rather_than_returning_an_unloadable_dataset(self, spec):
+        _report(spec, 0)
+        _report(spec, 1)
+        _report_finalize(spec, error="Traceback...\nOSError: disk full\n")
+
+        with pytest.raises(JobFailedError, match="disk full"):
+            _run(spec).wait(poll_interval=0.01)
+
+    def test_a_queued_finalize_job_is_not_yet_a_failure(self, spec):
+        _report(spec, 0)
+        _report(spec, 1)
+
+        assert _run(spec, finalize_pending=True).status().finalize_error is None
+
+    def test_a_consumer_needs_no_metadata(self, spec):
+        # nothing to finalize, so nothing to hold the run open
+        spec = replace(spec, needs_finalize=False)
+        spec.save()
+        _report(spec, 0)
+        _report(spec, 1)
+
+        assert _run(spec).status().state is RunState.COMPLETED
+
+    def test_the_worker_failure_is_reported_not_the_finalize_that_never_ran(self, spec):
+        # `afterok` means a failed run's finalize job never starts; saying so would bury
+        # the failure that actually stopped the run
+        _report(spec, 0)
+        _report(spec, 1, failures=[_failure(rank=0, shard_id=3)])
+
+        status = _run(spec).status()
+
+        assert status.finalize_error is None
+        with pytest.raises(ShardProcessingError):
+            _run(spec).wait(poll_interval=0.01)

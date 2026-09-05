@@ -35,7 +35,11 @@ class JobState(str, Enum):
     """Finished, and reported that it processed its shards."""
 
     FAILED = "failed"
-    """Finished, and reported that the workload raised."""
+    """Finished, and reported that it did not do all of its work.
+
+    Either the workload raised on one or more shards, or the job failed before it could
+    process any - see :attr:`RunStatus.failures` and :attr:`RunStatus.errors`.
+    """
 
     LOST = "lost"
     """Gone from the scheduler without reporting anything.
@@ -172,6 +176,15 @@ class RunSpec:
             str: Where that job writes what it did.
         """
         return os.path.join(self.run_dir, "jobs", f"{job_index}.json")
+
+    @property
+    def finalize_result_path(self) -> str:
+        """Path of the finalize job's result file.
+
+        Beside the worker results and read the same way: a finalize job that ends without
+        writing one did not write the metadata either, whatever the scheduler says about it.
+        """
+        return os.path.join(self.run_dir, "jobs", "finalize.json")
 
     def shard_marker_path(self, job_index: int, shard_id: int) -> str:
         """Path of the marker a job drops when it completes a shard.
@@ -311,6 +324,21 @@ class RunStatus:
 
     failures: list[Any] = field(default_factory=list)
     """Every :class:`ShardFailure` reported by every job, in the order they were read."""
+
+    errors: dict[int, str] = field(default_factory=dict)
+    """Tracebacks from jobs that failed before processing any shard, by job index.
+
+    Distinct from :attr:`failures`, which is the workload raising on a shard the job did
+    reach. A job in here produced none of its shards, so its share of the dataset is
+    missing entirely.
+    """
+
+    finalize_error: None | str = None
+    """Why the dataset's metadata was not written, if it was not.
+
+    A run whose shards all exist is still not loadable until the finalize job has run, so
+    this is a failure of the run even though every worker succeeded.
+    """
 
     lost_jobs: list[int] = field(default_factory=list)
     """Jobs that vanished without reporting - see :attr:`JobState.LOST`."""

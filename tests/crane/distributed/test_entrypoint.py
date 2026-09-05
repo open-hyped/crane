@@ -9,6 +9,7 @@ import pytest
 from crane import ArrowDatasetWriter, JsonDatasetWriter
 from crane.distributed.core._entrypoint import run_finalize, run_worker
 from crane.distributed.core.base import BackendView, DistributedBackend, RunState
+from crane.distributed.core.job import get_job_info, reset_job_info
 
 NUM_SHARDS, ROWS_PER_SHARD = 6, 5
 
@@ -57,6 +58,24 @@ def ds() -> datasets.IterableDataset:
     )
 
 
+@pytest.fixture(autouse=True)
+def isolate_jobs():
+    """Give every job a process that is not already part of a run.
+
+    On a cluster each job has one to itself; here they share the test process, so the
+    identity a job establishes has to be cleared the way exiting would clear it.
+    """
+    reset_job_info()
+    yield
+    reset_job_info()
+
+
+def _tag_with_job_index(row: dict) -> dict:
+    """Stand in for user code that needs to know where it is running."""
+    info = get_job_info()
+    return {"job": -1 if info is None else info.index}
+
+
 def _run_all_jobs(run) -> None:
     """Do what the cluster would do: every worker, then the finalize job."""
     for job_index in range(run.num_jobs):
@@ -80,6 +99,34 @@ class TestDistributedWrite:
 
         loaded = datasets.load_from_disk(out)
         assert all(row["doubled"] == row["value"] * 2 for row in loaded)
+
+    def test_a_transform_can_ask_which_job_it_is_running_in(self, ds, tmp_path):
+        # A transform is handed a row and nothing else, so asking is the only way it can
+        # know. Two processes, so the answer has to survive the job starting a worker;
+        # that it survives `spawn` as well as `fork` is `test_job.py`'s to show.
+        out = str(tmp_path / "out")
+        tagged = ds.map(
+            _tag_with_job_index,
+            features=datasets.Features(dict(ds.features) | {"job": datasets.Value("int64")}),
+        )
+        run = ArrowDatasetWriter(out, disable_tqdm=True).submit(
+            tagged, on=_LocalBackend(num_jobs=3, cpus=2)
+        )
+        _run_all_jobs(run)
+
+        loaded = datasets.load_from_disk(out)
+        assert set(loaded["job"]) == {0, 1, 2}
+
+    def test_a_local_write_is_not_part_of_a_run(self, ds, tmp_path):
+        # the same transform, written locally: nothing set it, so there is no job to name
+        out = str(tmp_path / "out")
+        tagged = ds.map(
+            _tag_with_job_index,
+            features=datasets.Features(dict(ds.features) | {"job": datasets.Value("int64")}),
+        )
+        ArrowDatasetWriter(out, disable_tqdm=True).write(tagged)
+
+        assert set(datasets.load_from_disk(out)["job"]) == {-1}
 
     def test_shard_names_carry_the_job_index_and_do_not_collide(self, ds, tmp_path):
         out = str(tmp_path / "out")
@@ -111,6 +158,9 @@ class TestDistributedWrite:
             "0.json",
             "1.json",
             "2.json",
+            # the finalize job reports too, so a run whose metadata was never written is
+            # not mistaken for one that completed
+            "finalize.json",
         ]
         # one marker per shard, named per job so two jobs cannot overwrite each other
         assert len(os.listdir(os.path.join(run.run_dir, "shards"))) == NUM_SHARDS
@@ -191,3 +241,16 @@ class TestFailingWorkload:
 
         assert failures and failures[0]["error_type"] == "ValueError"
         assert "nope" in failures[0]["error_message"]
+
+    def test_a_job_that_fails_before_starting_reports_rather_than_raising(self, ds, tmp_path):
+        # Everything a job does, setting up included, has to end in a report: a job that
+        # raised its way out would leave the run's handle waiting on a job it cannot see.
+        out = str(tmp_path / "out")
+        run = ArrowDatasetWriter(out, disable_tqdm=True).submit(ds, on=_LocalBackend(num_jobs=2))
+
+        assert run_worker(run.run_dir, 7) == 1
+
+        with open(run._spec.job_result_path(7)) as f:
+            result = json.load(f)
+
+        assert "out of range" in result["error"]

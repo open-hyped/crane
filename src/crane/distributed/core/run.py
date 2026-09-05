@@ -45,6 +45,16 @@ class RunNotFoundError(LookupError):
     """Raised when there is no run to attach to at a given location."""
 
 
+class JobFailedError(RuntimeError):
+    """Raised when a job failed outside the workload, or the metadata was never written.
+
+    Distinct from :class:`ShardProcessingError`, which is the workload raising on a shard.
+    A job in here got as far as starting and then failed - a dataset it could not open, a
+    transform that raised on import, an allocation it could not fit in - so it produced
+    none of its shards rather than some of them.
+    """
+
+
 class JobLostError(RuntimeError):
     """Raised when a job vanished without reporting anything.
 
@@ -104,9 +114,8 @@ class DistributedRun(object):
         """The backend's own job ids."""
         return list(self._spec.job_ids)
 
-    def _read_result(self, job_index: int) -> None | dict[str, Any]:
+    def _read_result(self, path: str) -> None | dict[str, Any]:
         """Read what one job reported about itself, if it reported at all."""
-        path = self._spec.job_result_path(job_index)
         if not os.path.exists(path):
             return None
 
@@ -132,6 +141,7 @@ class DistributedRun(object):
 
         jobs: dict[int, JobState] = {}
         failures: list[ShardFailure] = []
+        errors: dict[int, str] = {}
         lost: list[int] = []
 
         for job_index in range(self._spec.num_jobs):
@@ -139,7 +149,7 @@ class DistributedRun(object):
                 jobs[job_index] = view.active_jobs[job_index]
                 continue
 
-            result = self._read_result(job_index)
+            result = self._read_result(self._spec.job_result_path(job_index))
             if result is None:
                 jobs[job_index] = JobState.LOST
                 lost.append(job_index)
@@ -147,18 +157,61 @@ class DistributedRun(object):
 
             reported = [ShardFailure(**f) for f in result.get("failures", [])]
             failures.extend(reported)
-            jobs[job_index] = JobState.FAILED if reported else JobState.COMPLETED
+            if result.get("error") is not None:
+                errors[job_index] = result["error"]
+
+            done = not reported and job_index not in errors
+            jobs[job_index] = JobState.COMPLETED if done else JobState.FAILED
+
+        # Only asked once every worker has succeeded. A finalize job that follows a failed
+        # one never starts - it depends on `afterok` - so reporting it as a fault of its own
+        # would bury the failure that actually stopped the run.
+        finalize_error = (
+            self._finalize_error(view.finalize_pending)
+            if set(jobs.values()) == {JobState.COMPLETED}
+            else None
+        )
 
         return RunStatus(
-            state=self._run_state(view.finalize_pending, jobs),
+            state=self._run_state(view.finalize_pending, jobs, finalize_error),
             jobs=jobs,
             shards_completed=len(glob.glob(os.path.join(self._spec.run_dir, "shards", "*"))),
             num_shards=self._spec.num_shards,
             failures=failures,
+            errors=errors,
             lost_jobs=lost,
+            finalize_error=finalize_error,
         )
 
-    def _run_state(self, finalize_pending: bool, jobs: dict[int, JobState]) -> RunState:
+    def _finalize_error(self, finalize_pending: bool) -> None | str:
+        """Why the metadata was not written, or None if it was - or is still to be.
+
+        A finalize job is read exactly as a worker is: what it wrote is authoritative, and
+        having written nothing once the scheduler has let it go means it did not finish.
+
+        Only meaningful once every worker has succeeded; see :func:`status`.
+
+        Args:
+            finalize_pending (bool): Whether the scheduler still has the finalize job.
+
+        Returns:
+            None | str: The reason, if the metadata is known not to have been written.
+        """
+        if not self._spec.needs_finalize or finalize_pending:
+            return None
+
+        result = self._read_result(self._spec.finalize_result_path)
+        if result is None:
+            return (
+                "the finalize job ended without reporting, so the dataset's metadata was "
+                "never written and the dataset cannot be loaded until one succeeds"
+            )
+
+        return result.get("error")
+
+    def _run_state(
+        self, finalize_pending: bool, jobs: dict[int, JobState], finalize_error: None | str
+    ) -> RunState:
         """Reduce the per-job states to a state for the run as a whole."""
         states = set(jobs.values())
 
@@ -173,7 +226,10 @@ class DistributedRun(object):
             # queued: it depends on `afterok` and will never start.
             return RunState.FAILED
 
-        return RunState.FINALIZING if finalize_pending else RunState.COMPLETED
+        if finalize_pending:
+            return RunState.FINALIZING
+
+        return RunState.FAILED if finalize_error else RunState.COMPLETED
 
     def wait(self, timeout: None | float = None, poll_interval: float = _POLL_INTERVAL) -> None:
         """Block until the run is finished, and raise if it did not succeed.
@@ -189,12 +245,31 @@ class DistributedRun(object):
             poll_interval (float): How often to ask the scheduler for news, in seconds.
 
         Raises:
+            JobFailedError: If any job failed before processing a shard, or the metadata
+                was never written.
             ShardProcessingError: If the workload raised on any shard, carrying every
                 failure from every job.
             JobLostError: If any job vanished without reporting.
             TimeoutError: If :code:`timeout` passed while the run was still going.
         """
         status = self._follow(timeout=timeout, poll_interval=poll_interval)
+
+        # Raised before the shard failures because a job in here produced none of its
+        # shards: whatever stopped it is more likely to be the root cause than a shard the
+        # workload happened to raise on elsewhere.
+        if status.errors or status.finalize_error:
+            # The last line of a traceback is the exception itself; the rest is in the log.
+            reasons = [
+                f"job {index} failed before processing any shard ({error.strip().splitlines()[-1]})"
+                for index, error in status.errors.items()
+            ]
+            if status.finalize_error:
+                reasons.append(status.finalize_error.strip().splitlines()[-1])
+
+            raise JobFailedError(
+                f"Run {self.run_id} did not produce a complete dataset: "
+                f"{'; '.join(reasons)}. See `run.logs(job_index)` for the full traceback."
+            )
 
         if status.failures:
             # The same error a local run raises, with the same contents: every failure the
@@ -278,9 +353,9 @@ class DistributedRun(object):
 
             if (stopped_on is None) and self._should_stop_the_rest(status):
                 logger.error(
-                    f"Run {self.run_id} failed on {len(status.failures)} shard(s) and the "
-                    f"failure policy is {self.failure_policy.value}; stopping the "
-                    f"remaining jobs."
+                    f"Run {self.run_id} failed on {len(status.failures)} shard(s) and in "
+                    f"{len(status.errors)} job(s), and the failure policy is "
+                    f"{self.failure_policy.value}; stopping the remaining jobs."
                 )
                 stopped_on = status
                 self.cancel()
@@ -312,6 +387,10 @@ class DistributedRun(object):
         :attr:`FailurePolicy.SKIP_SHARD` means the opposite - the failed shards are expected
         losses - so the other jobs carry on.
 
+        A job that failed before reaching a shard counts the same way a shard failure does:
+        it is still the submitted work that could not run, and it costs a whole job's share
+        of the dataset rather than one shard of it.
+
         **Note**: this only happens while something is following the run. One left alone
         after :func:`submit` keeps going until its jobs finish on their own.
 
@@ -326,7 +405,7 @@ class DistributedRun(object):
 
         # A lost job is not counted here: it is not the workload failing, and a run that
         # loses one job to a preemption may still be worth letting finish.
-        return bool(status.failures)
+        return bool(status.failures or status.errors)
 
     def cancel(self) -> None:
         """Stop every job of the run, the finalize job included."""

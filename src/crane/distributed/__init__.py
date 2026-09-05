@@ -18,6 +18,15 @@ The backend is passed to :func:`submit`, which returns as soon as the work is qu
 A run can be picked up again from another process, or another machine, with
 :func:`attach` and the run directory it printed when it was submitted.
 
+Code inside a job - a transform, a callback, a workload - can ask which job it is running
+in with :func:`get_job_info`, which returns :code:`None` anywhere else:
+
+.. code-block:: python
+
+    from crane.distributed import get_job_info
+
+    info = get_job_info()  # None, unless this is a job of a distributed run
+
 The backends live at this level, beside this module; everything they are built from is in
 :mod:`crane.distributed.core`.
 """
@@ -26,6 +35,8 @@ __all__ = [
     "BackendView",
     "DistributedBackend",
     "DistributedRun",
+    "JobFailedError",
+    "JobInfo",
     "JobLostError",
     "JobState",
     "RunNotFoundError",
@@ -35,12 +46,15 @@ __all__ = [
     "Slurm",
     "SlurmNotAvailableError",
     "attach",
+    "get_job_info",
 ]
 
 from .core import (
     BackendView,
     DistributedBackend,
     DistributedRun,
+    JobFailedError,
+    JobInfo,
     JobLostError,
     JobState,
     RunNotFoundError,
@@ -48,5 +62,6 @@ from .core import (
     RunState,
     RunStatus,
     attach,
+    get_job_info,
 )
 from .slurm import Slurm, SlurmNotAvailableError

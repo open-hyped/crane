@@ -29,6 +29,8 @@ from ...core.runners.base import ShardProcessingError
 from ...logging.setup import setup_logging
 from . import payload
 from .base import RunSpec
+from .job import reset_job_info, set_job_info
+from .naming import JobShardName
 from .partition import select_shards
 
 logger = logging.getLogger(__name__)
@@ -91,16 +93,26 @@ def _report(spec: RunSpec, job_index: int, failures: list[Any], error: None | st
         failures (list[Any]): The shard failures the workload reported, if any.
         error (None | str): A traceback for a failure that was not a shard failure.
     """
-    path = spec.job_result_path(job_index)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
     # `ShardFailure` is a NamedTuple, so it renders to a dict the handle can rebuild it
     # from without either side knowing the field order.
-    result = {
-        "job_index": job_index,
-        "failures": [f._asdict() for f in failures],
-        "error": error,
-    }
+    _write_result(
+        spec.job_result_path(job_index),
+        {
+            "job_index": job_index,
+            "failures": [f._asdict() for f in failures],
+            "error": error,
+        },
+    )
+
+
+def _write_result(path: str, result: dict[str, Any]) -> None:
+    """Write a job's result file.
+
+    Args:
+        path (str): Where the result goes.
+        result (dict[str, Any]): What to write.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
@@ -125,16 +137,25 @@ def run_worker(run_dir: str, job_index: int) -> int:
     logger.info(f"Job {job_index} of {spec.num_jobs} starting for run {spec.run_id}.")
 
     try:
+        # Answers `get_job_info` from here on, in this process and in every process this
+        # one starts. Reset first because a run submitted from inside another job inherits
+        # that job's identity through the environment, and this job's own is the authority.
+        reset_job_info()
+        set_job_info(index=job_index, num_jobs=data.num_jobs, run_id=spec.run_id)
+        # Taking the shards here, rather than inside the write path, is what keeps
+        # `crane.core` from having to know that a run can be split at all: it is handed a
+        # smaller dataset and a way of naming files, both of which are ordinary things for
+        # a writer to be given.
+        ds = select_shards(data.ds, data.num_jobs, job_index)
+
         if spec.save_dir is not None:
-            data.target._write_splits(
-                data.ds, job_index=job_index, num_jobs=data.num_jobs, callbacks=[marker]
-            )
+            data.target._set_shard_name(JobShardName(job_index))
+            data.target._write_splits(ds, callbacks=[marker])
         else:
-            # A submitted consumer writes no dataset, so it takes its shards here rather
-            # than inside a write path it does not have.
+            # A submitted consumer writes no dataset, so it has no shards to name.
             data.target.add_callback(marker)
             data.target.consume(
-                select_shards(data.ds, data.num_jobs, job_index),
+                ds,
                 finalizer=data.finalizer,
                 batch_size=data.finalizer_batch_size,
                 formatting=data.finalizer_formatting,
@@ -180,8 +201,12 @@ def run_finalize(run_dir: str) -> int:
         data.target._finalize_splits(data.ds)
     except Exception:
         logger.exception(f"Finalizing run {spec.run_id} failed.")
+        _write_result(spec.finalize_result_path, {"error": traceback.format_exc()})
         return 1
 
+    # Reported even in success, so that the handle can tell a finalize job that ran from
+    # one the scheduler dropped: shards alone do not make a dataset that loads.
+    _write_result(spec.finalize_result_path, {"error": None})
     logger.info(f"Run {spec.run_id} finalized.")
     return 0
 
