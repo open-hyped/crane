@@ -35,6 +35,12 @@ docs = ["sphinx", "furo"]
 requires = ["setuptools >= 61.0.0", "setuptools_scm>=8.0.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+# pytest's default `norecursedirs` includes "dist", which is meant to skip the packaging
+# build directory - but it also matches `tests/crane/dist`, so the distributed tests were
+# silently never collected. This is the default list with that one entry removed.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "node_modules", "venv", "{arch}"]
+
 [tool.coverage.run]
 concurrency = ["multiprocessing","thread"]
 parallel = true
