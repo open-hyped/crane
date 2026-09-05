@@ -1,7 +1,7 @@
 """This module provides a utility function to configure logging for the application.
 
 The logging setup supports both console and file logging, with a customizable
-formatter that integrates worker rank information for distributed environments.
+formatter that names the worker and the distributed job a message came from.
 """
 
 import logging

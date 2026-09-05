@@ -142,6 +142,18 @@ run.watch()                         # progress across every job
 run.wait()                          # raises if the workload failed on any shard
 ```
 
+Code running inside a job - a transform, a callback, a workload - can ask where it is with
+`get_job_info`, which returns `None` everywhere else, so the same function works locally and
+distributed:
+
+```python
+from crane.distributed import get_job_info
+
+def transform(row):
+    info = get_job_info()           # None outside a distributed run
+    ...
+```
+
 **Note**: the save directory and the run directory have to be on storage every node can
 see, and shards are the unit of distribution - asking for more jobs than the dataset has
 shards simply submits fewer.
