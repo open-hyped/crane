@@ -1,11 +1,14 @@
 import json
 import os
+from dataclasses import dataclass
 from unittest.mock import ANY, MagicMock, call, patch
 
 import datasets
+import dill
 import pytest
 from datasets import Dataset, IterableDataset, IterableDatasetDict
 
+from crane.core.naming import ShardName
 from crane.core.utils import chdir
 from copy import deepcopy
 import pyarrow as pa
@@ -124,7 +127,10 @@ class TestBaseDatasetWriter:
             writer = MockDatasetWriter(
                 save_dir=tmp_path, overwrite=True, write_batch_size=1, num_proc=1
             )
-            writer._write_dataset(ds, save_dir=tmp_path)
+            # the steps `write` takes for one split, which is what this exercises
+            split = writer._prepare_split(ds)
+            writer._consume_dataset(split, save_dir=tmp_path)
+            writer._finalize_split(split, save_dir=tmp_path)
 
             # check sharding strategy
             sharding_mock.assert_called_once()
@@ -204,7 +210,7 @@ class TestBaseDatasetWriter:
             writer.write(ds)
 
             # the shards, then the metadata that needs all of them to exist
-            consume_mock.assert_called_once_with(ANY, tmp_path, job_index=None, callbacks=[])
+            consume_mock.assert_called_once_with(ANY, tmp_path, callbacks=[])
             finalize_mock.assert_called_once_with(ANY, tmp_path)
 
     @pytest.mark.parametrize("path_exists", [True, False])
@@ -269,6 +275,16 @@ class TestBaseDatasetWriter:
         assert [entry["filename"] for entry in state["_data_files"]] == shards
 
 
+@dataclass(frozen=True)
+class _PrefixedShardName(ShardName):
+    """A naming policy of the shape a launcher supplies, standing in for a real one."""
+
+    prefix: str
+
+    def __call__(self, shard_id: int, ext: str) -> str:
+        return self.prefix + super().__call__(shard_id, ext)
+
+
 class TestShardNaming:
     @pytest.fixture(autouse=True)
     def in_a_worker(self):
@@ -288,28 +304,34 @@ class TestShardNaming:
 
         return MockDatasetWriter
 
-    def test_local_name_is_unchanged(self, writer_type, tmp_path):
-        # datasets already on disk keep their names
+    def test_the_default_name_is_the_one_datasets_on_disk_already_use(self, writer_type, tmp_path):
         writer = writer_type(save_dir=str(tmp_path))
         assert writer._shard_path(42) == "shard-00042.mock"
 
-    def test_distributed_name_carries_the_job_index(self, writer_type, tmp_path):
+    def test_a_policy_replaces_the_name_entirely(self, writer_type, tmp_path):
         writer = writer_type(save_dir=str(tmp_path))
-        assert writer._shard_path(42, job_index=7) == "shard-007-00042.mock"
 
-    def test_jobs_cannot_collide_whatever_they_write(self, writer_type, tmp_path):
-        # every job numbers its own shards from zero; only the job index keeps them apart
-        writer = writer_type(save_dir=str(tmp_path))
-        names = {writer._shard_path(i, job_index=j) for j in range(4) for i in range(10)}
-        assert len(names) == 40
+        writer._set_shard_name(_PrefixedShardName("job-7-"))
+
+        assert writer._shard_path(42) == "job-7-shard-00042.mock"
 
     def test_the_writer_is_handed_a_path_not_an_id(self, writer_type, tmp_path):
         writer = writer_type(save_dir=str(tmp_path))
         info = MagicMock()
 
-        writer._open_shard(3, info=info, job_index=7)
+        writer._open_shard(3, info=info)
 
-        writer.initialize_shard.assert_called_once_with("shard-007-00003.mock", info)
+        writer.initialize_shard.assert_called_once_with("shard-00003.mock", info)
+
+    def test_the_policy_survives_being_sent_to_a_worker(self, writer_type, tmp_path):
+        # the sharding controller carries the writer into every worker process, so a policy
+        # that could not be pickled would name shards correctly only in the main process
+        writer = writer_type(save_dir=str(tmp_path))
+        writer._set_shard_name(_PrefixedShardName("job-7-"))
+
+        revived = dill.loads(dill.dumps(writer._shard_name))
+
+        assert revived(42, "mock") == "job-7-shard-00042.mock"
 
 
 class TestShardBufferOwnership:
