@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from crane.dist.core.base import JobState, RunSpec
-from crane.dist.slurm import Slurm, SlurmNotAvailableError
+from crane.dist.slurm import MAX_NUM_JOBS, Slurm, SlurmNotAvailableError
 
 
 @pytest.fixture
@@ -23,6 +23,25 @@ def spec(tmp_path) -> RunSpec:
 
 def _completed(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+
+
+class TestJobCount:
+    def test_accepts_a_usable_count(self):
+        assert Slurm(num_jobs=MAX_NUM_JOBS).num_jobs == MAX_NUM_JOBS
+
+    def test_rejects_more_jobs_than_slurm_will_take(self):
+        # rejected here rather than by the controller after a payload has been serialized
+        with pytest.raises(ValueError, match=f"more than the {MAX_NUM_JOBS} jobs"):
+            Slurm(num_jobs=MAX_NUM_JOBS + 1)
+
+    def test_the_error_says_what_to_do_instead(self):
+        with pytest.raises(ValueError, match="fewer jobs, each taking more"):
+            Slurm(num_jobs=5000)
+
+    @pytest.mark.parametrize("num_jobs", [0, -1])
+    def test_rejects_a_non_positive_count(self, num_jobs):
+        with pytest.raises(ValueError, match="at least one"):
+            Slurm(num_jobs=num_jobs)
 
 
 class TestAvailability:

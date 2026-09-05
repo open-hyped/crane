@@ -26,6 +26,16 @@ logger = logging.getLogger(__name__)
 _REQUIRED_COMMANDS = ("sbatch", "squeue", "scancel")
 """The Slurm tools a run cannot be driven without."""
 
+MAX_NUM_JOBS = 1000
+"""The most jobs a single run may be split across.
+
+Slurm caps the size of a job array, and a submission over that cap is rejected by the
+controller with a message about `MaxArraySize` rather than by anything crane says. The cap
+is configurable per site and commonly 1001, so this is a conservative round number: a run
+that needs more jobs than this wants a different shape - more shards per job - rather than a
+larger array.
+"""
+
 _COMMENT_PREFIX = "crane:"
 """Marks a job as crane's, and names the run it belongs to.
 
@@ -157,6 +167,27 @@ class Slurm(DistributedBackend):
     dry_run: bool = False
     """Render the scripts and print them instead of submitting. A wrong partition should
     cost a moment rather than a place in the queue."""
+
+    def __post_init__(self) -> None:
+        """Check the job count against what Slurm will accept.
+
+        Raised at construction rather than at submission, so that a number too large fails
+        where it was written instead of after a dataset has been prepared and a payload
+        serialized.
+
+        Raises:
+            ValueError: If :attr:`num_jobs` is not a usable array size.
+        """
+        if self.num_jobs < 1:
+            raise ValueError(f"`num_jobs` must be at least one, got {self.num_jobs}.")
+
+        if self.num_jobs > MAX_NUM_JOBS:
+            raise ValueError(
+                f"`num_jobs` is {self.num_jobs}, which is more than the {MAX_NUM_JOBS} jobs "
+                f"a run may be split across. Slurm limits the size of a job array, and a "
+                f"larger submission is rejected by the controller. Use fewer jobs, each "
+                f"taking more of the dataset's shards."
+            )
 
     @property
     def cpus_per_job(self) -> None | int:
