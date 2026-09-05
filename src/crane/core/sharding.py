@@ -92,13 +92,83 @@ class ShardingStrategy(str, Enum):
     """
 
 
+def _arrow_sample_item_size(batch: BatchT, key: str) -> int:
+    """Sum the values of a column of an arrow batch.
+
+    Args:
+        batch (BatchT): The arrow batch to measure.
+        key (str): The column holding the per-sample size.
+
+    Returns:
+        int: The accumulated size of the batch.
+    """
+    return pc.sum(batch.column(key)).as_py()
+
+
+def _arrow_sample_count(batch: BatchT, key: str) -> int:
+    """Count the samples of an arrow batch.
+
+    Args:
+        batch (BatchT): The arrow batch to measure.
+        key (str): Unused, kept for a uniform signature.
+
+    Returns:
+        int: The number of samples in the batch.
+    """
+    return batch.num_rows
+
+
+def _python_sample_item_size(batch: BatchT, key: str) -> int:
+    """Sum the values of a key of a python batch.
+
+    Args:
+        batch (BatchT): The python batch to measure.
+        key (str): The key holding the per-sample size.
+
+    Returns:
+        int: The accumulated size of the batch.
+    """
+    return sum(batch[key])
+
+
+def _python_sample_count(batch: BatchT, key: str) -> int:
+    """Count the samples of a python batch.
+
+    Args:
+        batch (BatchT): The python batch to measure.
+        key (str): Unused, kept for a uniform signature.
+
+    Returns:
+        int: The number of samples in the batch.
+    """
+    return len(next(iter(batch.values())))
+
+
+def _no_batch_size(batch: BatchT, key: str) -> int:
+    """Fallback for strategies that do not derive their size from the batch content.
+
+    Used by the :class:`FILE_SIZE` and :class:`NONE` strategies, which track the size of the
+    written file instead of the batch handed to them.
+
+    Args:
+        batch (BatchT): The batch to measure.
+        key (str): Unused, kept for a uniform signature.
+
+    Returns:
+        int: Always zero.
+    """
+    return 0
+
+
+# Named module-level functions instead of lambdas: the controller is sent to the workers by
+# pickling it, which only supports functions that can be looked up by qualified name.
 GET_BATCH_SIZE_FN_MAPPING: dict[
     tuple[FormatType, ShardingStrategy], Callable[[BatchT, str], int]
 ] = {
-    (FormatType.ARROW, ShardingStrategy.SAMPLE_ITEM): lambda b, k: pc.sum(b.column(k)).as_py(),
-    (FormatType.ARROW, ShardingStrategy.SAMPLE_COUNT): lambda b, k: b.num_rows,
-    (FormatType.PYTHON, ShardingStrategy.SAMPLE_ITEM): lambda b, k: sum(b[k]),
-    (FormatType.PYTHON, ShardingStrategy.SAMPLE_COUNT): lambda b, k: len(next(iter(b.values()))),
+    (FormatType.ARROW, ShardingStrategy.SAMPLE_ITEM): _arrow_sample_item_size,
+    (FormatType.ARROW, ShardingStrategy.SAMPLE_COUNT): _arrow_sample_count,
+    (FormatType.PYTHON, ShardingStrategy.SAMPLE_ITEM): _python_sample_item_size,
+    (FormatType.PYTHON, ShardingStrategy.SAMPLE_COUNT): _python_sample_count,
 }
 
 
@@ -175,7 +245,7 @@ class ShardingController(object):
         self._shard_bytes = 0
         self._batch_size = 0
         self._batch_size_fn = GET_BATCH_SIZE_FN_MAPPING.get(
-            (formatting, sharding_strategy), lambda b, k: 0
+            (formatting, sharding_strategy), _no_batch_size
         )
         # global shard state
         if is_multi_processed:

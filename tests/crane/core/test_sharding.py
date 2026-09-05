@@ -1,3 +1,4 @@
+import pickle
 from unittest.mock import MagicMock
 
 import pyarrow as pa
@@ -248,3 +249,31 @@ class TestShardingController:
 
         finalize_shard.assert_called_once()
         initialize_shard.assert_called_once()
+
+
+def _noop_shard(shard_id: int) -> None:
+    """Picklable stand-in for the shard initialization and finalization hooks.
+
+    Args:
+        shard_id (int): The shard the hook is called for.
+    """
+
+
+class TestShardingControllerPickling:
+    """The controller is sent to the workers by pickle under the `spawn` start method."""
+
+    @pytest.mark.parametrize("formatting", list(FormatType))
+    @pytest.mark.parametrize("strategy", list(ShardingStrategy))
+    def test_controller_is_picklable(self, strategy, formatting):
+        controller = ShardingController(
+            is_multi_processed=False,
+            sharding_strategy=strategy,
+            max_shard_size=1024,
+            sample_size_key=("size" if strategy is ShardingStrategy.SAMPLE_ITEM else None),
+            initialize_shard=_noop_shard,
+            finalize_shard=_noop_shard,
+            formatting=formatting,
+        )
+
+        reconstructed = pickle.loads(pickle.dumps(controller))
+        assert reconstructed._batch_size_fn is controller._batch_size_fn
