@@ -54,15 +54,48 @@ class Payload(object):
     """The data format :attr:`finalizer` expects."""
 
 
+def dumps(payload: Payload) -> bytes:
+    """Serialize a payload, having checked that it can be read back.
+
+    Serializing is the expensive half of submitting a realistic workload - a payload
+    carrying a tokenizer or a model is a large object graph, and `recurse=True` walks all
+    of it - so the check and the write share one pass rather than taking one each.
+
+    Args:
+        payload (Payload): The payload to serialize.
+
+    Returns:
+        bytes: The serialized payload.
+
+    Raises:
+        TypeError: If the payload cannot be serialized, naming the underlying error.
+    """
+    try:
+        blob = dill.dumps(payload, recurse=True)
+        # Dumping is not proof of being readable, and the job would be the one to find out.
+        dill.loads(blob)
+    except Exception as e:
+        raise TypeError(
+            "The dataset, writer or workload cannot be sent to a distributed job. This "
+            "usually means something in it closes over process-local state, such as a "
+            f"database connection, a socket or an open generator. Original error: {e}"
+        ) from e
+
+    return blob
+
+
 def dump(payload: Payload, path: str) -> None:
-    """Write a payload into the run directory.
+    """Write a payload into the run directory, having checked it can be read back.
 
     Args:
         payload (Payload): The payload to write.
         path (str): Where to write it.
+
+    Raises:
+        TypeError: If the payload cannot be serialized, naming the underlying error.
     """
     with open(path, "wb") as f:
-        dill.dump(payload, f, recurse=True)
+        f.write(dumps(payload))
 
 
 def load(path: str) -> Payload:
@@ -97,11 +130,4 @@ def check(payload: Payload) -> None:
     Raises:
         TypeError: If the payload cannot be serialized, naming the underlying error.
     """
-    try:
-        dill.loads(dill.dumps(payload, recurse=True))
-    except Exception as e:
-        raise TypeError(
-            "The dataset, writer or workload cannot be sent to a distributed job. This "
-            "usually means something in it closes over process-local state, such as a "
-            f"database connection, a socket or an open generator. Original error: {e}"
-        ) from e
+    dumps(payload)

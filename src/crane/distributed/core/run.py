@@ -498,8 +498,6 @@ def submit(
         finalizer_batch_size=finalizer_batch_size,
         finalizer_formatting=finalizer_formatting,
     )
-    payload.check(data)
-
     spec = RunSpec(
         run_id=run_id,
         run_dir=run_dir,
@@ -517,6 +515,7 @@ def submit(
         crane_version=__version__,
     )
 
+    # Checks as it writes, and raises before anything reaches the scheduler.
     payload.dump(data, spec.payload_path)
     spec.save()
 
