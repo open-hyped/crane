@@ -33,7 +33,11 @@ from .job import reset_job_info, set_job_info
 from .naming import JobShardName
 from .partition import select_shards
 
-logger = logging.getLogger(__name__)
+# Named rather than taken from `__name__`: this module is executed as `python -m`, which
+# makes `__name__` "__main__" - a logger outside the `crane` hierarchy, and so outside the
+# configuration `setup_logging` installs. Every line below, the failures included, went
+# unlogged in every real job because of it.
+logger = logging.getLogger("crane.distributed.core._entrypoint")
 
 
 class ShardMarkerCallback(Callback):

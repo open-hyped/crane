@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -254,3 +256,39 @@ class TestFailingWorkload:
             result = json.load(f)
 
         assert "out of range" in result["error"]
+
+
+class TestJobLogging:
+    def test_the_entrypoint_logs_under_the_configured_hierarchy(self):
+        """The module runs as `python -m`, so `__name__` would be "__main__".
+
+        `setup_logging` configures the `crane` logger, and a logger outside that hierarchy
+        is disabled by the very call that configures it - which silently cost every real
+        job every line this module emits, the failure paths included.
+        """
+        from crane.distributed.core import _entrypoint
+
+        assert _entrypoint.logger.name.startswith("crane.")
+
+    def test_a_job_run_as_a_module_says_what_it_did(self, ds, tmp_path):
+        # exactly how a backend starts a job, which is the case that broke
+        out = str(tmp_path / "out")
+        run = ArrowDatasetWriter(out, disable_tqdm=True).submit(ds, on=_LocalBackend(num_jobs=2))
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "crane.distributed.core._entrypoint",
+                run.run_dir,
+                "--job-index",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "starting for run" in result.stderr
+        assert "Job 0 finished." in result.stderr
