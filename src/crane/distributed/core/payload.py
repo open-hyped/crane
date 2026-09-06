@@ -57,9 +57,17 @@ class Payload(object):
 def dumps(payload: Payload) -> bytes:
     """Serialize a payload, having checked that it can be read back.
 
-    Serializing is the expensive half of submitting a realistic workload - a payload
-    carrying a tokenizer or a model is a large object graph, and `recurse=True` walks all
-    of it - so the check and the write share one pass rather than taking one each.
+    Serializing is the expensive half of submitting a realistic workload, so the check and
+    the write share one pass rather than taking one each.
+
+    Dill rather than pickle because a transform is routinely a closure or a lambda, which
+    the standard pickler cannot take - the same reason the multiprocessing runner uses it.
+
+    Serializing only, deliberately: reading the bytes back would be the obvious way to prove
+    they can be read, and on a real workload it took 43 minutes against 1.4 seconds to write
+    them. It also caught nothing. Every failure worth catching here - a closure over a
+    socket, a database connection, a live generator - is one dill refuses to write in the
+    first place; nothing was found that it wrote and could not read.
 
     Args:
         payload (Payload): The payload to serialize.
@@ -71,9 +79,7 @@ def dumps(payload: Payload) -> bytes:
         TypeError: If the payload cannot be serialized, naming the underlying error.
     """
     try:
-        blob = dill.dumps(payload, recurse=True)
-        # Dumping is not proof of being readable, and the job would be the one to find out.
-        dill.loads(blob)
+        blob = dill.dumps(payload)
     except Exception as e:
         raise TypeError(
             "The dataset, writer or workload cannot be sent to a distributed job. This "

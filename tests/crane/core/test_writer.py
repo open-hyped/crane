@@ -1,18 +1,18 @@
 import json
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from unittest.mock import ANY, MagicMock, call, patch
 
 import datasets
 import dill
+import pyarrow as pa
 import pytest
 from datasets import Dataset, IterableDataset, IterableDatasetDict
 
+from crane.core.batching import BatchBuffer
 from crane.core.naming import ShardName
 from crane.core.utils import chdir
-from copy import deepcopy
-import pyarrow as pa
-from crane.core.batching import BatchBuffer
 from crane.core.worker import get_worker_info, reset_worker_info, set_worker_info
 from crane.core.writer import BaseDatasetWriter
 
