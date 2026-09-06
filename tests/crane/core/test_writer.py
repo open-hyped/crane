@@ -1,12 +1,16 @@
 import json
 import os
+from copy import deepcopy
 from unittest.mock import ANY, MagicMock, call, patch
 
 import datasets
+import pyarrow as pa
 import pytest
 from datasets import Dataset, IterableDataset, IterableDatasetDict
 
+from crane.core.batching import BatchBuffer
 from crane.core.utils import chdir
+from crane.core.worker import get_worker_info, reset_worker_info, set_worker_info
 from crane.core.writer import BaseDatasetWriter
 
 
@@ -121,14 +125,27 @@ class TestBaseDatasetWriter:
             init = consumer_mock.mock_calls[0].kwargs["on_start"]
             finalize = consumer_mock.mock_calls[0].kwargs["on_finish"]
 
-            # apply function
-            mock_batch = MagicMock()
+            # Apply the function. A real batch rather than a mock: the writer regroups what
+            # it is handed into batches of `write_batch_size`, so it has to be able to count
+            # the rows. One row against a size of one passes straight through.
+            #
+            # Inside a worker, because that is where the write path runs and where the
+            # buffer lives - the sharding controller is mocked here, so the shard that would
+            # have created it never opens.
+            reset_worker_info()
+            set_worker_info(rank=0, num_workers=1, seed=None)
+            get_worker_info().ctx.buffer = BatchBuffer(1)
+            get_worker_info().ctx.write_fn = None
+            mock_batch = {"obj": [0]}
+            sharding_mock().callback.return_value = mock_batch
+            sharding_mock.reset_mock(return_value=False)
+            sharding_mock().callback.return_value = mock_batch
             fn(mock_batch)
             # make sure that the callback is called first, then the write sample
             # and finally the update function. The callback also opens the shard for the
             # batch, so it runs for every strategy, including NONE.
             sharding_mock().callback.assert_called_once_with(mock_batch)
-            writer.write_batch_py.assert_called_once_with(sharding_mock().callback())
+            writer.write_batch_py.assert_called_once_with(mock_batch)
             sharding_mock().update(writer.write_batch_py())
 
             # starting a worker must not open a shard - that only happens once a batch
@@ -221,3 +238,57 @@ class TestBaseDatasetWriter:
                 state = json.load(f)
 
         assert [entry["filename"] for entry in state["_data_files"]] == shards
+
+
+class TestShardBufferOwnership:
+    """Where the batch buffer lives, which is not a detail.
+
+    A worker receives one copy of the writer for writing and another for finalizing - they
+    are pickled separately, the write path through the runner's setup and the finalize path
+    through its worker callbacks. A buffer held on the writer is therefore filled by one copy
+    and flushed by the other, which is to say never: every row still held when a shard closes
+    is dropped, silently, and a dataset smaller than one batch comes out empty.
+    """
+
+    @pytest.fixture
+    def writer_type(self):
+        class MockDatasetWriter(BaseDatasetWriter):
+            SHARD_FILE_EXTENSION = "mock"
+            written = []
+
+            def write_batch_arrow(self, batch):
+                type(self).written.append(batch)
+                return 1
+
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        MockDatasetWriter.written = []
+        return MockDatasetWriter
+
+    @pytest.fixture(autouse=True)
+    def in_a_worker(self):
+        reset_worker_info()
+        set_worker_info(rank=0, num_workers=1, seed=None)
+        yield
+        reset_worker_info()
+
+    def test_a_separate_copy_can_flush_what_another_buffered(self, writer_type, tmp_path):
+        writer = writer_type(save_dir=str(tmp_path), write_batch_size=1000)
+        # exactly what a worker is handed: two copies that never see each other again
+        finalizing_copy = deepcopy(writer)
+
+        writer._open_shard(0, info=MagicMock())
+        writer._write_batches(writer.write_batch_arrow, pa.table({"x": list(range(10))}))
+        assert writer_type.written == [], "nothing should be written before a batch is full"
+
+        finalizing_copy._close_shard(info=MagicMock())
+
+        assert [t.num_rows for t in writer_type.written] == [10]
+
+    def test_the_buffer_is_not_kept_on_the_writer(self, writer_type, tmp_path):
+        writer = writer_type(save_dir=str(tmp_path), write_batch_size=1000)
+        writer._open_shard(0, info=MagicMock())
+
+        assert not hasattr(writer, "_buffer")
+        assert get_worker_info().ctx.buffer is not None

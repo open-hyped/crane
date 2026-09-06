@@ -28,11 +28,13 @@ from datasets.iterable_dataset import (
     TakeExamplesIterable,
 )
 
+from .batching import BatchBuffer
 from .callbacks.base import Callback
 from .consumer import DatasetConsumer
 from .runners.base import FailurePolicy
 from .sharding import ShardingController, ShardingStrategy
 from .utils import Compose, FormatType, RunAll, chdir
+from .worker import get_worker_info
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +117,20 @@ class BaseDatasetWriter(ABC):
                 to the number of CPU cores.
             prefetch_factor (int): Number of samples to prefetch for improved
                 performance. Defaults to 8.
-            write_batch_size (int): The number of samples to write in a single batch.
-                Defaults to 32.
+            write_batch_size (int): The number of samples handed to the writer in one call,
+                and so the unit the output is laid out in. Batches are regrouped to exactly
+                this size before they reach the writer, whatever size the pipeline delivered:
+                a pipeline's batches are sized for throughput and rebatched by every
+                :func:`map` along the way, so without that the layout of the output would be
+                an accident of the pipeline. Writing a batch per sample costs the writer
+                nothing and costs every reader afterwards - a dataset written that way took
+                125 seconds to open rather than 0.09. Defaults to 256.
+
+                Interacts with :code:`max_shard_size`: a shard rolls over on what has reached
+                the file, and nothing reaches it until a batch is full, so a shard can
+                overshoot by up to one batch and a dataset smaller than one batch is written
+                as a single shard. The rows held are held in memory, so a very wide row wants
+                a smaller value.
             tqdm_update_interval (float): The interval in seconds at which the tqdm
                 progress bar updates. Default is 0.1.
             disable_tqdm (bool): Whether to disable the tqdm progress bar. Default is
@@ -149,6 +163,63 @@ class BaseDatasetWriter(ABC):
         # callbacks
         self._callbacks = callbacks
         self._failure_policy = failure_policy
+
+    def _open_shard(self, shard_id: int, info: datasets.DatasetInfo) -> None:
+        """Start a shard, and the buffer that regroups what is written to it.
+
+        The buffer belongs to the worker rather than to the writer, alongside the shard's
+        own file handle. A worker receives its own copy of the writer for writing and
+        another for finalizing - they travel to it separately - so a buffer held on the
+        writer would be filled by one copy and flushed by the other, which is to say never.
+
+        Args:
+            shard_id (int): The id of the shard being opened.
+            info (datasets.DatasetInfo): Information about the dataset being written.
+        """
+        worker = get_worker_info()
+        worker.ctx.buffer = BatchBuffer(self._write_batch_size)
+        worker.ctx.write_fn = None
+        self.initialize_shard(shard_id, info)
+
+    def _close_shard(self, info: datasets.DatasetInfo) -> None:
+        """Write whatever the buffer still holds, then let the writer close the shard.
+
+        The flush has to happen here rather than at the end of the run: a shard rolls over
+        while there is still data to come, and rows held past that point would be written
+        into the shard that follows - or, for the last shard, into nothing at all.
+
+        Args:
+            info (datasets.DatasetInfo): Information about the dataset being written.
+        """
+        worker = get_worker_info()
+        remainder = worker.ctx.buffer.take()
+        if (remainder is not None) and (worker.ctx.write_fn is not None):
+            worker.ctx.write_fn(remainder)
+
+        self.finalize_shard(info)
+
+    def _write_batches(self, write_fn: Callable[[Any], int], batch: Any) -> int:
+        """Hand the writer batches of the size it asked for, whatever size arrived.
+
+        A pipeline's batches are sized for throughput and rebatched by every :func:`map`
+        along the way, so what arrives here is not what :code:`write_batch_size` asked for.
+        Passing it straight through makes that accident the layout of the file - a batch per
+        row, if that is what the pipeline happened to produce - which costs nothing to write
+        and is expensive for every reader of the file afterwards.
+
+        Args:
+            write_fn (Callable[[Any], int]): The writer's own batch write, bound by
+                :func:`_get_write_fn`.
+            batch (Any): The batch that arrived.
+
+        Returns:
+            int: The number of bytes written, which is zero while the buffer is still short
+            of a full batch.
+        """
+        # Kept for `_close_shard`, which flushes without having a batch of its own to pass.
+        worker = get_worker_info()
+        worker.ctx.write_fn = write_fn
+        return sum(write_fn(full) for full in worker.ctx.buffer.add(batch))
 
     def _write_info(self, ds: datasets.IterableDataset) -> None:
         """Write dataset information to a JSON file in the save directory.
@@ -273,8 +344,8 @@ class BaseDatasetWriter(ABC):
             sharding_strategy=self._sharding_strategy,
             max_shard_size=self._max_shard_size,
             sample_size_key=self._sample_size_key,
-            initialize_shard=partial(self.initialize_shard, info=ds.info),
-            finalize_shard=partial(self.finalize_shard, info=ds.info),
+            initialize_shard=partial(self._open_shard, info=ds.info),
+            finalize_shard=partial(self._close_shard, info=ds.info),
             formatting=formatting,
         )
 
@@ -283,7 +354,7 @@ class BaseDatasetWriter(ABC):
         # shard but never rolls over.
         write_fn = Compose(
             sharding_controller.update,
-            write_fn,
+            partial(self._write_batches, write_fn),
             sharding_controller.callback,
         )
 

@@ -3,6 +3,7 @@ import os
 
 import pyarrow.dataset as pds
 import pyarrow.parquet as pq
+import pytest
 from datasets import Dataset, DatasetDict, load_dataset
 
 from crane import ParquetDatasetWriter
@@ -76,7 +77,9 @@ class TestParquetDatasetWriter_RowGroupSize(BaseTestDatasetWriter):
 class TestParquetDatasetWriter_Metadata(BaseTestDatasetWriter):
     dataset = Dataset.from_dict({"obj": list(range(100))})
     writer_type = ParquetDatasetWriter
-    # small shards, so there is more than one for `_metadata` to summarise
+    # Small shards, so there is more than one for `_metadata` to summarise. `write_batch_size`
+    # is what makes that possible: a shard rolls over on what has reached the file, and
+    # nothing reaches it until a batch is full.
     writer_args = {"max_shard_size": 1024, "write_batch_size": 10}
 
     def execute_test(self) -> None:
@@ -135,3 +138,44 @@ class TestParquetDatasetWriter_MetadataForDatasetDict(BaseTestDatasetWriter):
         for split, ds in type(self).dataset.items():
             metadata = pq.read_metadata(os.path.join(split, "_metadata"))
             assert metadata.num_rows == len(ds)
+
+
+class TestRowGroupSize:
+    """Row groups are the unit a reader skips and the unit compression works over.
+
+    `ParquetWriter.write_table` emits at least one row group per call, so writing pipeline
+    batches straight through gave a row group per batch - 4000 of them for 4000 rows when
+    the pipeline delivered one row at a time.
+    """
+
+    @staticmethod
+    def _row_groups(save_dir: str) -> int:
+        shard = next(f for f in os.listdir(save_dir) if f.endswith(".parquet"))
+        return pq.ParquetFile(os.path.join(save_dir, shard)).metadata.num_row_groups
+
+    @pytest.fixture
+    def ds(self):
+        return Dataset.from_dict({"x": list(range(1000))}).to_iterable_dataset(num_shards=1)
+
+    @pytest.mark.parametrize("prefetch", [1, 8, 256])
+    def test_the_pipeline_batch_size_does_not_decide_the_file_layout(self, ds, tmp_path, prefetch):
+        out = str(tmp_path / f"out-{prefetch}")
+        ParquetDatasetWriter(
+            out,
+            write_batch_size=500,
+            prefetch_factor=prefetch,
+            num_proc=1,
+            disable_tqdm=True,
+            write_metadata=False,
+        ).write(ds)
+
+        assert self._row_groups(out) == 2
+
+    def test_every_row_survives_being_buffered(self, ds, tmp_path):
+        out = str(tmp_path / "out")
+        ParquetDatasetWriter(
+            out, write_batch_size=512, num_proc=1, disable_tqdm=True, write_metadata=False
+        ).write(ds)
+
+        loaded = load_dataset("parquet", data_files=os.path.join(out, "*.parquet"))["train"]
+        assert sorted(loaded["x"]) == list(range(1000))
