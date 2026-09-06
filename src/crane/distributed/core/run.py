@@ -515,8 +515,18 @@ def submit(
         crane_version=__version__,
     )
 
+    # Said out loud because this is the slow step of submitting, and how slow depends
+    # entirely on what the caller closed over - a payload carrying a tokenizer or a model
+    # takes long enough that silence here is indistinguishable from a hang.
+    logger.info(f"Serializing the workload of run {run_id}.")
+    started = time.monotonic()
     # Checks as it writes, and raises before anything reaches the scheduler.
     payload.dump(data, spec.payload_path)
+    logger.info(
+        f"Workload serialized to {spec.payload_path} "
+        f"({os.path.getsize(spec.payload_path) / 1024 / 1024:.1f} MB) "
+        f"in {time.monotonic() - started:.1f}s."
+    )
     spec.save()
 
     # Saved twice: the jobs need the spec in order to start, and the ids only exist once
