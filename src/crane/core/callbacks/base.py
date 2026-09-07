@@ -102,6 +102,14 @@ class CallbackManager(Callback):
         """
         self._callbacks = callbacks
 
+    def add(self, callback: Callback) -> None:
+        """Register another callback.
+
+        Args:
+            callback (Callback): The callback to add.
+        """
+        self._callbacks = self._callbacks + [callback]
+
     def on_start(self, monitor: ProgressMonitor, ds: IterableDataset) -> None:
         """Calls the on_start method of each registered callback.
 

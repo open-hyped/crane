@@ -1,7 +1,7 @@
 """This module provides a utility function to configure logging for the application.
 
 The logging setup supports both console and file logging, with a customizable
-formatter that integrates worker rank information for distributed environments.
+formatter that names the worker and the distributed job a message came from.
 """
 
 import logging
@@ -25,6 +25,10 @@ def setup_logging(level: int | str, log_file: None | str = None) -> None:
     """
     logging_config = {
         "version": 1,
+        # `dictConfig` disables every logger that already exists unless told otherwise, and
+        # this runs on import - so importing crane would silently switch off the logging an
+        # application had already configured for itself.
+        "disable_existing_loggers": False,
         "formatters": {
             "custom": {
                 "()": "crane.logging.formatter.RankAwareFormatter",

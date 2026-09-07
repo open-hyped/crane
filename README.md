@@ -16,6 +16,7 @@ Hyped Crane is a Python library designed to simplify working with HuggingFace `d
 
 - **Streaming-Friendly Transformations**: Apply lazy, streaming-friendly transformations to iterable datasets without preloading data into memory.
 - **Seamless Multiprocessing**: Effortlessly process and write datasets using multiple processes, improving performance on large datasets.
+- **Distributed Writes**: Spread the same write across the jobs of a cluster when one machine is not enough, without changing anything about the dataset or the writer.
 - **Easily Extendable**: Provides a straightforward interface to implement support for custom data formats.
 - **Interoperability with Hugging Face Datasets**: Write datasets in formats directly loadable using HuggingFace’s `load_from_disk` function.
 
@@ -92,6 +93,70 @@ writer.write(ds)
 # Reload the dataset from disk
 ds = datasets.load_from_disk("data")
 ```
+
+## Running on a Cluster
+
+When one machine is not enough, `crane.distributed` spreads the same write across the jobs of a
+cluster. Nothing about the dataset or the writer changes - only where the work happens:
+
+```python
+from crane import ArrowDatasetWriter
+from crane.distributed import Slurm
+
+writer = ArrowDatasetWriter("/shared/data", overwrite=True)
+
+run = writer.submit(
+    ds,
+    on=Slurm(num_jobs=16, partition="cpu", time="04:00:00", cpus_per_task=8),
+)
+run.wait()
+```
+
+Read the two numbers together: `num_jobs=16` and `cpus_per_task=8` give **16 jobs of 8
+processes each**. `num_proc` is what spreads a run across the processes of one machine, and
+the backend is what spreads it across machines; left unset, `num_proc` follows the cores the
+job reserved.
+
+The dataset's shards are divided between the jobs, each job runs exactly the runner
+described below over its own share, and one final job writes the metadata once every shard
+exists. The result is a single dataset, indistinguishable from what a local `write` would
+have produced:
+
+```python
+ds = datasets.load_from_disk("/shared/data")
+```
+
+**`write` blocks, `submit` does not.** When `write` returns, the dataset is on disk. `submit`
+returns as soon as the work is queued and hands back a handle - so a run that takes hours
+does not need the submitting process to stay alive:
+
+```python
+run = writer.submit(ds, on=Slurm(num_jobs=16, partition="cpu"))
+print(run.run_dir)                  # note this down, then close the laptop
+
+# later, from anywhere that can see the run directory
+from crane.distributed import attach
+
+run = attach("/shared/data/.crane/data-2f9c1a")
+run.watch()                         # progress across every job
+run.wait()                          # raises if the workload failed on any shard
+```
+
+Code running inside a job - a transform, a callback, a workload - can ask where it is with
+`get_job_info`, which returns `None` everywhere else, so the same function works locally and
+distributed:
+
+```python
+from crane.distributed import get_job_info
+
+def transform(row):
+    info = get_job_info()           # None outside a distributed run
+    ...
+```
+
+**Note**: the save directory and the run directory have to be on storage every node can
+see, and shards are the unit of distribution - asking for more jobs than the dataset has
+shards simply submits fewer.
 
 ## How Multiprocessing Works
 
