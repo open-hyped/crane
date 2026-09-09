@@ -54,6 +54,7 @@ from .base import (
     FailurePolicy,
     ShardFailure,
     ShardProcessingError,
+    WorkerDiedError,
     WorkerProcessingStage,
     WorkerRole,
 )
@@ -357,6 +358,17 @@ class MessageType(Enum):
     """
 
 
+_COMMAND_RESPONSE_POLL = 1.0
+"""How long to wait for a worker to answer a command before checking it is still there."""
+
+_WORKER_LIVENESS_INTERVAL = 5.0
+"""How often the message loop looks for workers that died without reporting, in seconds.
+
+Long enough not to matter against a run measured in hours, short enough that a killed
+worker is noticed while the traceback is still worth reading.
+"""
+
+
 class Worker(mp.Process):
     """A worker process for parallel data processing.
 
@@ -520,6 +532,20 @@ class Worker(mp.Process):
         self._send_command(command)
 
         if blocking:
+            # Waited for in slices, checking in between that there is still someone to
+            # answer. A worker that was killed rather than allowed to fail never replies,
+            # and this is where the run used to stop for good - the controller asking a
+            # dead worker to change role and waiting for its answer.
+            #
+            # Only once the process has been started: before that there is nothing to
+            # supervise, and waiting on a reply from a process that was never going to send
+            # one is the caller's business, not a death to report.
+            while (self.pid is not None) and not self._recv_resp_conn.poll(_COMMAND_RESPONSE_POLL):
+                # `exitcode`, not `is_alive`: a process that has finished and one that has
+                # not started are both "not alive", and only the first has an exit code.
+                if self.exitcode is not None:
+                    raise WorkerDiedError([(self._rank, self.exitcode)])
+
             # wait for feedback from worker
             accepted = self._recv_resp_conn.recv()
             # log
@@ -1084,6 +1110,43 @@ class WorkerController(object):
         self.workers[rank].join()
         self.joined_ranks.add(rank)
 
+    def dead_unjoined_workers(self) -> list[tuple[int, None | int]]:
+        """The workers that have ended without reporting, with their exit codes.
+
+        A worker sends :attr:`MessageType.DONE` from a :code:`finally`, so one that exits
+        without it was killed rather than allowed to finish - and nothing else in the run
+        can tell. The message loop counts DONE messages to know when the run is over, so
+        such a worker leaves it waiting for a message that can never arrive.
+
+        Returns:
+            list[tuple[int, None | int]]: The rank and exit code of each, empty when every
+            worker is either alive or properly joined.
+        """
+        return [
+            (rank, self.workers[rank].exitcode)
+            for rank in range(self.num_workers)
+            # `exitcode`, not `is_alive`: a process that has not been started yet is also
+            # not alive, and only one that has actually run has an exit code.
+            if (rank not in self.joined_ranks) and (self.workers[rank].exitcode is not None)
+        ]
+
+    def terminate_stragglers(self, timeout: float = 10.0) -> None:
+        """Bring down whatever is still running, after a worker has died.
+
+        The survivors of a killed worker are usually waiting on it - blocked on a queue it
+        will never feed, or on a lock it never released - so asking them to stop and waiting
+        politely does not end the run. This makes sure the process can exit and say why.
+
+        Args:
+            timeout (float): Seconds to wait for each worker to go, after terminating it.
+        """
+        for rank in range(self.num_workers):
+            if self.workers[rank].is_alive():
+                self.workers[rank].terminate()
+
+        for rank in range(self.num_workers):
+            self.workers[rank].join(timeout=timeout)
+
     def assert_all_workers_joined(self) -> None:
         """Asserts that all workers have completed execution and joined the main thread."""
         assert len(self.joined_ranks) == len(self.workers)
@@ -1338,8 +1401,25 @@ class DynamicMultiprocessingRunner(BaseRunner):
 
         done = False
         while not done:
-            # receive message from worker
-            msg = msg_queue.get()
+            # Waited for in slices rather than indefinitely. Every message the loop needs
+            # comes from a worker, so a worker that was killed rather than allowed to fail
+            # takes its messages with it - and the loop would otherwise wait for them for
+            # as long as the scheduler allows.
+            try:
+                msg = msg_queue.get(timeout=_WORKER_LIVENESS_INTERVAL)
+            except Empty:
+                deaths = controller.dead_unjoined_workers()
+                if deaths:
+                    self._logger.error(
+                        f"{len(deaths)} worker(s) ended without reporting: {deaths}. "
+                        f"Stopping the run."
+                    )
+                    controller.stop_all()
+                    # `from None`: the `Empty` is how the death was noticed, not why it
+                    # happened, and chaining it would put an irrelevant traceback first.
+                    raise WorkerDiedError(deaths) from None
+                continue
+
             msg = orjson.loads(msg)
             # unpack message
             rank: int = msg["rank"]
@@ -1629,7 +1709,13 @@ class DynamicMultiprocessingRunner(BaseRunner):
             # shutdown
             monitor._mark_as_done()
             self._callback.on_done(monitor)
-            controller.assert_all_workers_joined()
+            # A run that lost a worker cannot have joined all of them, and the survivors are
+            # waiting on the one that went. Asserting here would replace an error that says
+            # which worker died and why with one that says only that the count is wrong.
+            if controller.dead_unjoined_workers():
+                controller.terminate_stragglers()
+            else:
+                controller.assert_all_workers_joined()
             msg_queue.close()
 
         if self._failures:

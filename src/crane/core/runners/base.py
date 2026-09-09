@@ -5,6 +5,7 @@ It includes an abstract base class for runners, an enumeration for worker roles
 during multiprocessing, and how a runner reacts to a workload that raises.
 """
 
+import signal
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Callable, NamedTuple
@@ -80,6 +81,77 @@ class ShardProcessingError(Exception):
             else f"Processing failed on {len(failures)} occasion(s)."
         )
         super().__init__(f"{summary}\nFirst failure:\n{failures[0].stack_trace}")
+
+
+class WorkerDiedError(Exception):
+    """Raised when a worker process ended without saying why.
+
+    A worker that raises reports the traceback and exits tidily; this is the other kind of
+    death - the process was taken away with no chance to say anything. An out-of-memory
+    kill, a segfault in a native library, an external :code:`kill`.
+
+    It is worth its own error because nothing else in the run can see it. A worker reports
+    :attr:`MessageType.DONE` from a :code:`finally`, and the message loop counts those to
+    know when the run is over, so a worker killed outright leaves the loop waiting on a
+    message that will never come. Before this error existed a run in that state simply hung
+    - one real case sat for three hours after its last byte was written, and would have
+    burned its whole walltime.
+
+    Attributes:
+        deaths (list[tuple[int, None | int]]): The rank and exit code of every worker that
+            ended this way.
+    """
+
+    def __init__(self, deaths: list[tuple[int, None | int]]) -> None:
+        """Initialize the error from the workers that died.
+
+        Args:
+            deaths (list[tuple[int, None | int]]): Rank and exit code of each dead worker.
+        """
+        self.deaths = deaths
+        lines = [f"  worker {rank}: {_describe_exit(code)}" for rank, code in deaths]
+        super().__init__(
+            f"{len(deaths)} worker process(es) ended without reporting:\n"
+            + "\n".join(lines)
+            + "\n\nNothing was raised by the workload - these processes were killed rather "
+            "than allowed to fail, so there is no traceback to show. The run is stopped "
+            "because the remaining workers would otherwise wait for messages that can no "
+            "longer arrive."
+        )
+
+
+def _describe_exit(code: None | int) -> str:
+    """Say what an exit code means, in the terms the reader needs.
+
+    Args:
+        code (None | int): The process's exit code, negative for a signal.
+
+    Returns:
+        str: A description of how the process ended, and what usually causes it.
+    """
+    if code is None:
+        return "still running, but unreachable"
+
+    if code >= 0:
+        return f"exited with status {code}"
+
+    signal_number = -code
+    try:
+        name = signal.Signals(signal_number).name
+    except ValueError:  # pragma: not covered
+        name = f"signal {signal_number}"
+
+    if signal_number == signal.SIGKILL:
+        return (
+            f"killed by {name}, which is almost always the out-of-memory killer - "
+            "the job or the machine ran out of memory. Fewer processes, or more memory, "
+            "or a smaller `write_batch_size`"
+        )
+
+    if signal_number == signal.SIGSEGV:
+        return f"killed by {name} - a crash inside a native library, not in python"
+
+    return f"killed by {name}"
 
 
 class WorkerRole(str, Enum):
