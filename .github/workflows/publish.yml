@@ -110,6 +110,12 @@ jobs:
       id-token: write  # IMPORTANT: mandatory for sigstore
 
     steps:
+    # `--notes-from-tag` reads the annotation out of the local repository, so this job
+    # needs a checkout - it had none, having only ever downloaded the built dists.
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        fetch-tags: true
     - name: Download all the dists
       uses: actions/download-artifact@v4
       with:
@@ -127,7 +133,6 @@ jobs:
       run: >-
         gh release create
         "$GITHUB_REF_NAME"
-        --repo "$GITHUB_REPOSITORY"
         --verify-tag
         --notes-from-tag
     - name: Upload artifact signatures to GitHub Release
