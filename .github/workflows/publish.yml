@@ -1,9 +1,17 @@
 name: Publish Python 🐍 distribution 📦 to PyPI
 
 on:
-  create:
+  # `push`, not `create`: the create event takes no ref filter - GitHub ignores the
+  # `tags` list rather than rejecting it, so every branch creation fired a publish too.
+  push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+
+# One publish per tag. Two runs for the same tag race each other into PyPI, and the
+# loser fails on a version the winner has already uploaded.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -22,6 +30,17 @@ jobs:
         # "0.1.dev1+g<hash>") that PyPI rejects. Fetch full history and tags.
         fetch-depth: 0
         fetch-tags: true
+    - name: Check the tag is on main
+      # A tag names a commit, not a branch, so the `tags` filter above cannot say which
+      # branch it came from - a tag pushed from a feature branch would publish it. The
+      # commit has to be an ancestor of main to count as released.
+      run: |
+        git fetch --no-tags --depth=1 origin main
+        if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+          echo "::error::Tag $GITHUB_REF_NAME points at a commit that is not on main; refusing to publish."
+          exit 1
+        fi
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -109,7 +128,8 @@ jobs:
         gh release create
         "$GITHUB_REF_NAME"
         --repo "$GITHUB_REPOSITORY"
-        --notes ""
+        --verify-tag
+        --notes-from-tag
     - name: Upload artifact signatures to GitHub Release
       env:
         GITHUB_TOKEN: ${{ github.token }}
