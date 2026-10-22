@@ -16,8 +16,7 @@ license = {text = "Apache 2.0"}
 dependencies = [
     "dill>=0.3.8",
     "orjson>=3.10.1",
-    "datasets>=4.0.0",
-    "fsspec<=2023.9.2",
+    "datasets>=5.0.0",
     "pyarrow>=17.0.0"
 ]
 
