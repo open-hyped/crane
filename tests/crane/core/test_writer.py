@@ -69,7 +69,11 @@ class TestBaseDatasetWriter:
         MockDatasetWriter.write_batch_arrow.__get__ = MagicMock()
 
         mock_writer = MockDatasetWriter("out")
-        ds = IterableDataset.from_generator([])
+
+        def empty():
+            yield from ()
+
+        ds = IterableDataset.from_generator(empty)
 
         # None type is python
         formatting, writer_fn = mock_writer._get_write_fn(ds.with_format(type=None))
