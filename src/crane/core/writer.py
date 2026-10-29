@@ -12,7 +12,6 @@ import os
 import shutil
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, ClassVar, TypeAlias
 
@@ -27,6 +26,7 @@ from datasets.iterable_dataset import (
     StepExamplesIterable,
     TakeExamplesIterable,
 )
+from datasets.utils.py_utils import asdict
 
 from .batching import BatchBuffer
 from .callbacks.base import Callback
@@ -228,6 +228,8 @@ class BaseDatasetWriter(ABC):
             ds (datasets.IterableDataset): The dataset object containing metadata to be saved.
         """
         logger.info(f"Writing dataset info to {os.getcwd()}.")
+        # datasets' own asdict, as DatasetInfo.write_to_directory uses: the standard library's
+        # turns a ClassLabel's names into a datasets.List, which is not JSON serializable
         info = asdict(ds.info)
 
         with open(
