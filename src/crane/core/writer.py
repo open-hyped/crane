@@ -12,7 +12,6 @@ import os
 import shutil
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import asdict
 from functools import partial
 from typing import Any, Callable, ClassVar, TypeAlias
 
@@ -228,15 +227,7 @@ class BaseDatasetWriter(ABC):
             ds (datasets.IterableDataset): The dataset object containing metadata to be saved.
         """
         logger.info(f"Writing dataset info to {os.getcwd()}.")
-        info = asdict(ds.info)
-
-        with open(
-            datasets.config.DATASET_INFO_FILENAME, "w", encoding="utf-8"
-        ) as dataset_info_file:
-            # Sort only the first level of keys, or we might shuffle fields of nested
-            # features if we use sort_keys=True
-            sorted_keys_dataset_info = {key: info[key] for key in sorted(info)}
-            json.dump(sorted_keys_dataset_info, dataset_info_file, indent=2)
+        ds.info.write_to_directory(".", pretty_print=True)
 
     def _write_state(self, ds: datasets.IterableDataset) -> None:
         """Write the state of the dataset to a JSON file in the save directory.

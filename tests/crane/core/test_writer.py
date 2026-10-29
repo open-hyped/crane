@@ -243,6 +243,44 @@ class TestBaseDatasetWriter:
 
         assert [entry["filename"] for entry in state["_data_files"]] == shards
 
+    @pytest.mark.parametrize(
+        ("features", "data"),
+        [
+            (
+                datasets.Features({"label": datasets.ClassLabel(names=["no", "yes"])}),
+                {"label": [0]},
+            ),
+            (
+                datasets.Features(
+                    {
+                        "answer": {
+                            "label": datasets.ClassLabel(names=["no", "yes"]),
+                            "probabilities": datasets.List(datasets.Value("float32")),
+                        }
+                    }
+                ),
+                {"answer": [{"label": 0, "probabilities": [1.0, 0.0]}]},
+            ),
+        ],
+        ids=["class_label", "nested_class_label"],
+    )
+    def test_write_info_round_trips_features(self, features, data, tmp_path):
+        ds = Dataset.from_dict(data, features=features).to_iterable_dataset(1)
+
+        class MockDatasetWriter(BaseDatasetWriter):
+            write_batch_py = MagicMock()
+            initialize = MagicMock()
+            finalize = MagicMock()
+            initialize_shard = MagicMock()
+            finalize_shard = MagicMock()
+
+        writer = MockDatasetWriter(save_dir=tmp_path, overwrite=True, num_proc=1)
+
+        with chdir(tmp_path):
+            writer._write_info(ds)
+
+        assert datasets.DatasetInfo.from_directory(str(tmp_path)).features == features
+
 
 class TestShardBufferOwnership:
     """Where the batch buffer lives, which is not a detail.
