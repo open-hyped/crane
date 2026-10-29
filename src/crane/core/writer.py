@@ -26,7 +26,6 @@ from datasets.iterable_dataset import (
     StepExamplesIterable,
     TakeExamplesIterable,
 )
-from datasets.utils.py_utils import asdict
 
 from .batching import BatchBuffer
 from .callbacks.base import Callback
@@ -228,17 +227,7 @@ class BaseDatasetWriter(ABC):
             ds (datasets.IterableDataset): The dataset object containing metadata to be saved.
         """
         logger.info(f"Writing dataset info to {os.getcwd()}.")
-        # datasets' own asdict, as DatasetInfo.write_to_directory uses: the standard library's
-        # turns a ClassLabel's names into a datasets.List, which is not JSON serializable
-        info = asdict(ds.info)
-
-        with open(
-            datasets.config.DATASET_INFO_FILENAME, "w", encoding="utf-8"
-        ) as dataset_info_file:
-            # Sort only the first level of keys, or we might shuffle fields of nested
-            # features if we use sort_keys=True
-            sorted_keys_dataset_info = {key: info[key] for key in sorted(info)}
-            json.dump(sorted_keys_dataset_info, dataset_info_file, indent=2)
+        ds.info.write_to_directory(".", pretty_print=True)
 
     def _write_state(self, ds: datasets.IterableDataset) -> None:
         """Write the state of the dataset to a JSON file in the save directory.
