@@ -14,7 +14,7 @@ from typing import Any, Callable, TypeAlias
 from datasets.iterable_dataset import FormattingConfig, IterableDataset
 
 from ..callbacks.base import CallbackManager
-from ..iterables import ExampleIndices, TimedExamplesIterable
+from ..iterables import ExampleIndices, TimedExamplesIterable, shards_to_read
 from ..monitor import ProgressMonitor, ProgressReport
 from ..utils import clock
 from ..worker import reset_worker_info, set_worker_info
@@ -98,7 +98,7 @@ class MainProcessRunner(BaseRunner):
         # set the worker info
         set_worker_info(rank=0, num_workers=1, seed=None)
 
-        num_shards = ds.n_shards
+        num_shards = shards_to_read(ds._ex_iterable)
         # prepare the dataset
         ds = ds._prepare_ex_iterable_for_iteration(batch_size=self._batch_size)
         logger.info(f"Dataset prepared with {num_shards} shards.")

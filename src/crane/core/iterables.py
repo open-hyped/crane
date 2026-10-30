@@ -13,6 +13,8 @@ from datasets.iterable_dataset import (
     FilteredExamplesIterable,
     Key,
     MappedExamplesIterable,
+    SkipExamplesIterable,
+    TakeExamplesIterable,
     _BaseExamplesIterable,
 )
 
@@ -407,6 +409,57 @@ class QueueExamplesIterable(BaseExamplesIterable):
         """
         self._state_dict = {}
         return self._state_dict
+
+
+def _chain(ex_iterable: _BaseExamplesIterable) -> Iterable[_BaseExamplesIterable]:
+    """Every examples iterable of a chain, the last first, and those of every branch of it.
+
+    A branch is one of the datasets a :func:`concatenate_datasets` or
+    :func:`interleave_datasets` reads.
+    """
+    yield ex_iterable
+    for child in [
+        getattr(ex_iterable, "ex_iterable", None),
+        *getattr(ex_iterable, "ex_iterables", []),
+    ]:
+        if child is not None:
+            yield from _chain(child)
+
+
+def shards_to_read(ex_iterable: _BaseExamplesIterable) -> int:
+    """The number of shards a runner reads a dataset in.
+
+    Those of its data sources, or one, with a warning, when a :func:`skip` or :func:`take` counts
+    its samples across all of them.
+
+    Sharded, `datasets` splits the count of :func:`skip` and :func:`take` among the shards, so
+    that the workers of a PyTorch :code:`DataLoader` skip and take :code:`n` between them. A
+    runner reading the shards one by one would skip and take :code:`n / num_shards` of each,
+    neither the first :code:`n` samples nor those after them. Read as one shard, they count as in
+    one pass over the dataset; the steps after them can still be processed by several workers.
+
+    Args:
+        ex_iterable (_BaseExamplesIterable): The last examples iterable of the dataset.
+
+    Returns:
+        int: The number of shards to read the dataset in.
+    """
+    shards = ex_iterable.num_shards
+    windows = [
+        type(step).__name__
+        for step in _chain(ex_iterable)
+        if isinstance(step, (SkipExamplesIterable, TakeExamplesIterable))
+        and step.split_when_sharding
+        and step.num_shards > 1
+    ]
+    if not windows:
+        return shards
+    logger.warning(
+        f"The dataset is cut by skip or take ({', '.join(windows)}) and has {shards} shards: "
+        "it is read as one shard, so that they count its samples as in one pass, and the "
+        "shards are not read in parallel. Cut each shard instead to read them in parallel."
+    )
+    return 1
 
 
 class ExampleIndices:
