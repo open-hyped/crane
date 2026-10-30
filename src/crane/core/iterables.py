@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import warnings
+from collections import deque
 from copy import copy
 from queue import Empty, Queue
 from typing import Any, Iterable
@@ -447,6 +448,7 @@ class FastRebatchedArrowExamplesIterable(RebatchedArrowExamplesIterable):
         concatenates all Arrow tables and yields them as a single batch. Otherwise,
         it processes the tables to yield batches of the specified size. Remaining
         smaller chunks are buffered and combined as subsequent data becomes available.
+        The rows are yielded in the order they arrive in.
 
         Args:
             it (Iterable[tuple[Key, pa.Table]]): An iterable of Arrow tables with keys.
@@ -460,47 +462,51 @@ class FastRebatchedArrowExamplesIterable(RebatchedArrowExamplesIterable):
             yield ("all", pa.concat_tables([pa_table for _, pa_table in it]))
             return
 
-        keys_buffer = []
-        chunks_buffer = []
+        # the chunks not yet yielded, in the order they arrived, and their number of rows
+        keys_buffer: deque[Key] = deque()
+        chunks_buffer: deque[pa.RecordBatch] = deque()
+        buffered = 0
 
         for key, pa_table in it:
             for i, chunk in enumerate(pa_table.to_reader(max_chunksize=self.batch_size)):
-                # check if the chunk matches the batch size
-                if len(chunk) == self.batch_size:
+                if len(chunk) == 0:
+                    continue
+                # a chunk of exactly the batch size is yielded as it is, but only when nothing
+                # is buffered before it: the rows must leave in the order they came in
+                if buffered == 0 and len(chunk) == self.batch_size:
                     yield f"{key}_{i}", pa.Table.from_batches([chunk])
-                else:
-                    # update buffers
-                    keys_buffer.append(f"{key}_{i}")
-                    chunks_buffer.append(chunk)
+                    continue
 
-            # buffer contains enough samples to build batch
-            while sum(map(len, chunks_buffer)) >= self.batch_size:
-                collected_keys_buffer = []
-                collected_chunks_buffer = []
-                # collect chunks that make up a batch
-                while sum(map(len, collected_chunks_buffer)) < self.batch_size:
-                    chunk = chunks_buffer.pop(0)
-                    collected_keys_buffer.append(keys_buffer.pop(0))
-                    collected_chunks_buffer.append(chunk)
+                keys_buffer.append(f"{key}_{i}")
+                chunks_buffer.append(chunk)
+                buffered += len(chunk)
 
-                size = sum(map(len, collected_chunks_buffer))
-                # cut last chunk to exactly match batch size
-                if size > self.batch_size:
-                    chunk = collected_chunks_buffer.pop(-1)
-                    cutoff = len(chunk) - (size - self.batch_size)
-                    collected_chunks_buffer.append(chunk.slice(0, cutoff))
-                    chunks_buffer.append(chunk.slice(cutoff))
-                    keys_buffer.append(collected_keys_buffer[-1])
+                # buffer contains enough samples to build batches
+                while buffered >= self.batch_size:
+                    collected_keys_buffer = []
+                    collected_chunks_buffer = []
+                    size = 0
+                    # collect chunks from the front that make up a batch
+                    while size < self.batch_size:
+                        chunk = chunks_buffer.popleft()
+                        chunk_key = keys_buffer.popleft()
+                        take = min(len(chunk), self.batch_size - size)
+                        if take < len(chunk):
+                            # the rest of a chunk cut to fill the batch stays first in line
+                            chunks_buffer.appendleft(chunk.slice(take))
+                            keys_buffer.appendleft(chunk_key)
+                            chunk = chunk.slice(0, take)
+                        collected_keys_buffer.append(chunk_key)
+                        collected_chunks_buffer.append(chunk)
+                        size += take
 
-                # join collected chunks
-                batch = pa.Table.from_batches(collected_chunks_buffer)
-                assert len(batch) == self.batch_size
-                yield "_".join(collected_keys_buffer), batch
+                    buffered -= self.batch_size
+                    yield "_".join(collected_keys_buffer), pa.Table.from_batches(
+                        collected_chunks_buffer
+                    )
 
-        if len(chunks_buffer) > 0 and not self.drop_last_batch:
-            batch = pa.Table.from_batches(chunks_buffer)
-            assert len(batch) < self.batch_size
-            yield "_".join(keys_buffer), batch
+        if buffered > 0 and not self.drop_last_batch:
+            yield "_".join(keys_buffer), pa.Table.from_batches(list(chunks_buffer))
 
     def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
         """Iterate over Arrow tables, rebatching them as per the configured batch size.

@@ -243,6 +243,55 @@ class TestFastRebatchedArrowExamplesIterable:
             assert len(pa_tables) == 3
             assert pa_tables[2].num_rows == 4
 
+    @pytest.mark.parametrize(
+        "sizes",
+        [
+            # a full batch arrives while a smaller chunk is still buffered
+            [3, 8, 5],
+            # a chunk is cut while another is buffered behind it
+            [3, 3, 3, 3],
+            # tables larger than a batch, cut into a full batch and a remainder
+            [5, 10, 7, 1, 4],
+            # empty tables in between
+            [0, 2, 0, 9, 0],
+            [1] * 13,
+        ],
+    )
+    @pytest.mark.parametrize("drop_last_batch", [True, False])
+    def test_iter_arrow_keeps_the_order(self, sizes: list[int], drop_last_batch: bool) -> None:
+        # the rows numbered in the order the source yields them, in tables of `sizes` rows
+        bounds = [sum(sizes[:i]) for i in range(len(sizes) + 1)]
+        tables = [
+            pa.table({"field": list(range(start, stop))}) for start, stop in zip(bounds, bounds[1:])
+        ]
+        ex_iterable = FastRebatchedArrowExamplesIterable(
+            _RestartingArrowIterable(tables), batch_size=4, drop_last_batch=drop_last_batch
+        )
+
+        pa_tables = [pa_table for _, pa_table in ex_iterable.iter_arrow()]
+        rows = [row for pa_table in pa_tables for row in pa_table["field"].to_pylist()]
+
+        total = bounds[-1]
+        kept = total - total % 4 if drop_last_batch else total
+        assert rows == list(range(kept))
+        assert all(pa_table.num_rows == 4 for pa_table in pa_tables[: kept // 4])
+        assert len(pa_tables) == -(-kept // 4)
+
+    @pytest.mark.parametrize("sizes", [[3, 8, 5], [5, 10, 7, 1, 4], [1] * 13])
+    def test_iter_arrow_matches_datasets(self, sizes: list[int]) -> None:
+        bounds = [sum(sizes[:i]) for i in range(len(sizes) + 1)]
+        tables = [
+            pa.table({"field": list(range(start, stop))}) for start, stop in zip(bounds, bounds[1:])
+        ]
+
+        def batches(cls: type) -> list[list[int]]:
+            ex_iterable = cls(_RestartingArrowIterable(tables), batch_size=4, drop_last_batch=False)
+            return [pa_table["field"].to_pylist() for _, pa_table in ex_iterable.iter_arrow()]
+
+        assert batches(FastRebatchedArrowExamplesIterable) == batches(
+            RebatchedArrowExamplesIterable
+        )
+
 
 class TestQueueExamplesIterableShutdown:
     """How a consumer learns the queue is finished."""
