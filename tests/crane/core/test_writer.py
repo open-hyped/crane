@@ -108,6 +108,7 @@ class TestBaseDatasetWriter:
             patch("crane.core.writer.ShardingController") as sharding_mock,
         ):
             sharding_mock().is_active = with_sharding
+            sharding_mock().shard_lengths = [1]
             sharding_mock.reset_mock()
 
             writer = MockDatasetWriter(
@@ -210,7 +211,7 @@ class TestBaseDatasetWriter:
             writer.write(ds)
 
             write_split_mock.assert_has_calls(
-                [call(split, os.path.join(tmp_path, key)) for key, split in ds.items()],
+                [call(split, os.path.join(tmp_path, key), key) for key, split in ds.items()],
                 any_order=True,
             )
 

@@ -1,6 +1,7 @@
 """Custon ExampleIterable Implementations to control and monitor data flow."""
 from __future__ import annotations
 
+import logging
 import warnings
 from copy import copy
 from queue import Empty, Queue
@@ -9,13 +10,15 @@ from typing import Any, Iterable
 import pyarrow as pa
 from datasets.formatting import PythonFormatter
 from datasets.iterable_dataset import (
+    FilteredExamplesIterable,
     Key,
-    RebatchedArrowExamplesIterable,
+    MappedExamplesIterable,
     _BaseExamplesIterable,
-    _convert_to_arrow,
 )
 
 from .utils import EMA, clock
+
+logger = logging.getLogger(__name__)
 
 
 class BaseExamplesIterable(_BaseExamplesIterable):
@@ -406,125 +409,98 @@ class QueueExamplesIterable(BaseExamplesIterable):
         return self._state_dict
 
 
-class FastRebatchedArrowExamplesIterable(RebatchedArrowExamplesIterable):
-    """An optimized iterable for rebatching Arrow tables.
+class ExampleIndices:
+    """The indices a worker's :func:`map` and :func:`filter` steps have counted.
 
-    This class extends :class:`RebatchedArrowExamplesIterable` to efficiently handle
-    Arrow table rebatching, including combining smaller chunks into batches of
-    a specified size.
+    They are carried over to the next stream the worker processes. A function given indices
+    (:code:`with_indices=True`) gets the position of each sample among those its worker has
+    processed: counted from 0, and on across every shard and role the worker takes, as for a
+    worker of a PyTorch :code:`DataLoader`. With a single worker, these are the positions in the
+    dataset, as in one pass over it; with several, they are not.
+
+    A runner builds a fresh copy of the steps for every stream, and a step counts from the index
+    in its state, so :func:`resume` sets each step's index to where the previous copy stopped and
+    :func:`pause` reads it back. Steps are matched by their position from the end of the chain,
+    the last step first, which is the same whether the chain reads a shard or a queue.
     """
 
-    @classmethod
-    def replace_rebatch(cls, ex_iterable: _BaseExamplesIterable) -> _BaseExamplesIterable:
-        """Replace the rebatching operation in an examples iterable.
+    def __init__(self) -> None:
+        """Initialize the indices of a worker that has processed nothing yet."""
+        self._indices: list[int] = []
 
-        This method recursively replaces instances of :class:`RebatchedArrowExamplesIterable`
-        within an iterable with :class:`FastRebatchedArrowExamplesIterable`, retaining the
-        configuration (e.g., batch size, drop_last_batch).
+    @staticmethod
+    def steps(ex_iterable: _BaseExamplesIterable) -> list[MappedExamplesIterable]:
+        """The :func:`map` and :func:`filter` steps of a chain, the last step first.
 
         Args:
-            ex_iterable (_BaseExamplesIterable): The examples iterable to modify.
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the chain.
 
         Returns:
-            _BaseExamplesIterable: The modified examples iterable with replaced rebatching.
+            list[MappedExamplesIterable]: The steps, a :func:`filter` being a
+            :class:`MappedExamplesIterable` too.
         """
-        if isinstance(ex_iterable, RebatchedArrowExamplesIterable):
-            return cls(
-                ex_iterable=ex_iterable.ex_iterable,
-                batch_size=ex_iterable.batch_size,
-                drop_last_batch=ex_iterable.drop_last_batch,
-            )
+        steps = []
+        while ex_iterable is not None:
+            if isinstance(ex_iterable, MappedExamplesIterable):
+                steps.append(ex_iterable)
+            ex_iterable = getattr(ex_iterable, "ex_iterable", None)
+        return steps
 
-        if hasattr(ex_iterable, "ex_iterable"):
-            ex_iterable.ex_iterable = cls.replace_rebatch(ex_iterable.ex_iterable)
-
-        return ex_iterable
-
-    def rebatch_arrow(self, it: Iterable[tuple[Key, pa.Table]]) -> Iterable[tuple[Key, pa.Table]]:
-        """Rebatch Arrow tables into sub-tables of the specified batch size.
-
-        If the :code:`batch_size` is not set or is less than or equal to zero, this method
-        concatenates all Arrow tables and yields them as a single batch. Otherwise,
-        it processes the tables to yield batches of the specified size. Remaining
-        smaller chunks are buffered and combined as subsequent data becomes available.
+    def resume(self, ex_iterable: _BaseExamplesIterable) -> None:
+        """Let the steps of a chain count on from where the previous chain stopped.
 
         Args:
-            it (Iterable[tuple[Key, pa.Table]]): An iterable of Arrow tables with keys.
-
-        Yields:
-            tuple[Key, pa.Table]: A tuple containing the key and the rebatched Arrow table.
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the chain, its
+                state initialized with :code:`_init_state_dict`.
         """
-        # return full arrow table containing the whole dataset
-        # mirrors the behavior implemented in _convert_to_arrow
-        if (self.batch_size is None) or (self.batch_size <= 0):
-            yield ("all", pa.concat_tables([pa_table for _, pa_table in it]))
-            return
+        # not strict: a chain may have more steps than the last, or fewer
+        for step, index in zip(self.steps(ex_iterable), self._indices, strict=False):
+            step._state_dict["previous_state_example_idx"] = index
 
-        keys_buffer = []
-        chunks_buffer = []
+    def pause(self, ex_iterable: _BaseExamplesIterable) -> None:
+        """Keep the index each step of a chain has counted to, for the next chain.
 
-        for key, pa_table in it:
-            for i, chunk in enumerate(pa_table.to_reader(max_chunksize=self.batch_size)):
-                # check if the chunk matches the batch size
-                if len(chunk) == self.batch_size:
-                    yield f"{key}_{i}", pa.Table.from_batches([chunk])
-                else:
-                    # update buffers
-                    keys_buffer.append(f"{key}_{i}")
-                    chunks_buffer.append(chunk)
-
-            # buffer contains enough samples to build batch
-            while sum(map(len, chunks_buffer)) >= self.batch_size:
-                collected_keys_buffer = []
-                collected_chunks_buffer = []
-                # collect chunks that make up a batch
-                while sum(map(len, collected_chunks_buffer)) < self.batch_size:
-                    chunk = chunks_buffer.pop(0)
-                    collected_keys_buffer.append(keys_buffer.pop(0))
-                    collected_chunks_buffer.append(chunk)
-
-                size = sum(map(len, collected_chunks_buffer))
-                # cut last chunk to exactly match batch size
-                if size > self.batch_size:
-                    chunk = collected_chunks_buffer.pop(-1)
-                    cutoff = len(chunk) - (size - self.batch_size)
-                    collected_chunks_buffer.append(chunk.slice(0, cutoff))
-                    chunks_buffer.append(chunk.slice(cutoff))
-                    keys_buffer.append(collected_keys_buffer[-1])
-
-                # join collected chunks
-                batch = pa.Table.from_batches(collected_chunks_buffer)
-                assert len(batch) == self.batch_size
-                yield "_".join(collected_keys_buffer), batch
-
-        if len(chunks_buffer) > 0 and not self.drop_last_batch:
-            batch = pa.Table.from_batches(chunks_buffer)
-            assert len(batch) < self.batch_size
-            yield "_".join(keys_buffer), batch
-
-    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
-        """Iterate over Arrow tables, rebatching them as per the configured batch size.
-
-        If :code:`batch_size` is set, the data is iterated and rebatched into sub-tables of
-        the specified size. Otherwise, the entire dataset is processed as a single batch.
-
-        Yields:
-            tuple[Key, pa.Table]: A tuple containing the key and the Arrow table.
+        Args:
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the chain, done
+                or stopped.
         """
-        # recover state if present
-        if self._state_dict and self._state_dict["previous_state"]:
-            self.ex_iterable.load_state_dict(self._state_dict["previous_state"])
-        # create the iterator over pyarrow tables
-        it = (
-            self.rebatch_arrow(self.ex_iterable.iter_arrow())
-            if self.ex_iterable.iter_arrow is not None
-            else _convert_to_arrow(
-                self.ex_iterable, batch_size=self.batch_size, drop_last_batch=self.drop_last_batch
+        indices = [
+            step._state_dict["previous_state_example_idx"] for step in self.steps(ex_iterable)
+        ]
+        # a chain with fewer steps, like one reading a queue rather than a shard, keeps the
+        # indices of the steps it lacks
+        self._indices[: len(indices)] = indices
+
+    @classmethod
+    def warn(cls, ex_iterable: _BaseExamplesIterable, num_proc: int) -> None:
+        """Log a warning where the indices a function is given are not the positions.
+
+        That is, not the positions of the samples in the dataset: when several workers count
+        them, and after a :func:`filter`.
+
+        Args:
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the dataset.
+            num_proc (int): The number of processes the dataset is processed by.
+        """
+        filtered = after_filter = indexed = False
+        # from the source on, so that a step is known to come after a filter
+        for step in reversed(cls.steps(ex_iterable)):
+            if step.with_indices:
+                indexed = True
+                after_filter = after_filter or filtered
+            filtered = filtered or isinstance(step, FilteredExamplesIterable)
+
+        if indexed and num_proc > 1:
+            logger.warning(
+                f"A function is given indices (with_indices=True) and {num_proc} processes "
+                "process the dataset: each worker counts the samples it processes from 0, so "
+                "the indices are not the positions in the dataset. Use num_proc=1 for those."
             )
-        )
-
-        # TODO: manage state
-        yield from it
+        if after_filter:
+            logger.warning(
+                "A function is given indices (with_indices=True) after a filter: they count the "
+                "samples the filter kept, not the positions in the dataset before it."
+            )
 
 
 class ExamplesIterablePipeline(list[_BaseExamplesIterable]):

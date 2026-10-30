@@ -40,8 +40,8 @@ from datasets.iterable_dataset import (
 
 from ..callbacks.base import CallbackManager
 from ..iterables import (
+    ExampleIndices,
     ExamplesIterablePipeline,
-    FastRebatchedArrowExamplesIterable,
     QueueExamplesIterable,
     StoppableExamplesIterable,
     TimedExamplesIterable,
@@ -715,6 +715,8 @@ class Worker(mp.Process):
             # Build the role contexts before announcing readiness: under `spawn` this is
             # where the setup blob is unpickled, and it must happen in the child.
             self._build_contexts()
+            # the indices the worker's steps have counted, by the steps they belong to
+            self._indices: dict[int, ExampleIndices] = {}
             # initialize worker
             self._worker_init()
             self._send_msg(MessageType.READY)
@@ -760,15 +762,14 @@ class Worker(mp.Process):
                         )
                         work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
 
-                        # replace all rebatch operations with fast rebatch
-                        # this especially replaces the rebatch operation that was added
-                        # by the .map call earlier
-                        work_iterator = FastRebatchedArrowExamplesIterable.replace_rebatch(
-                            work_iterator
-                        )
-
                         # prepare the iterator for iteration
                         work_iterator._init_state_dict()
+                        # the standalone and consumer roles run the same steps and so share
+                        # their indices; the producer's steps are its own
+                        indices = self._indices.setdefault(
+                            id(self._active_ctx.transform), ExampleIndices()
+                        )
+                        indices.resume(work_iterator)
                         # create the python iterable that executes the workload
                         # dynamically use the pyarrow iterable to avoid unnecessary conversion
                         iter_arrow = (self._active_ctx.finalizer_formatting is not None) and (
@@ -827,6 +828,7 @@ class Worker(mp.Process):
                                         MessageType.CTX_SWITCH,
                                         payload=(previous_role.value, command.role.value),
                                     )
+                                    indices.pause(work_iterator)
                                     self._accept(command, busy=True)
                                     # recreate the work iterable
                                     break
@@ -843,6 +845,7 @@ class Worker(mp.Process):
                         else:
                             # producer exhausted
                             stream_exhausted = True
+                            indices.pause(work_iterator)
                             self._logger.info("Finished processing current context.")
                             # send final progress update and completion message
                             _report_progress(clock(), num_samples, last_report)
@@ -1304,10 +1307,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
             A tuple containing the source dataset and a processor function representing the lazy
             operations applied to the dataset.
         """
-        # get the examples iterable from the dataset and replace all rebatch operations
-        # with fast rebatch, we do this once at the beginning to make sure the transform
-        # also contains only fast rebatch operations
-        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ds._ex_iterable)
+        ex_iterable = ds._ex_iterable
 
         # TODO: rethink which ex_iterable items to include
         #       maybe just all of them, i.e. all those that have the ex_iterable attribute
@@ -1334,9 +1334,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         ds = IterableDataset(
             ex_iterable=ex_iterable, formatting=FormattingConfig(format_type="arrow")
         )
-        # replace rebatch operations with fast rebatch
         ex_iterable = ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch)
-        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ex_iterable)
         return ex_iterable, transform
 
     def _handle_message_loop(

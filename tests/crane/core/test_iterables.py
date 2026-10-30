@@ -6,10 +6,9 @@ from time import sleep
 import pyarrow as pa
 import pytest
 from datasets import Dataset
-from datasets.iterable_dataset import RebatchedArrowExamplesIterable, _BaseExamplesIterable
+from datasets.iterable_dataset import _BaseExamplesIterable
 
 from crane.core.iterables import (
-    FastRebatchedArrowExamplesIterable,
     PreQueueExamplesIterable,
     QueueExamplesIterable,
     StoppableExamplesIterable,
@@ -207,41 +206,6 @@ class TestQueueExamplesIterable:
 
         # Ensure the iterable doesn't yield anything when the queue is empty
         assert len([x for x in queue_iterable._iter_arrow()]) == 0
-
-
-class TestFastRebatchedArrowExamplesIterable:
-    def test_replace_rebatch(self) -> None:
-        ex_iterable = TimedExamplesIterable(None)
-        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ex_iterable)
-        assert isinstance(ex_iterable, TimedExamplesIterable)
-
-        ex_iterable = RebatchedArrowExamplesIterable(None, None)
-        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ex_iterable)
-        assert isinstance(ex_iterable, FastRebatchedArrowExamplesIterable)
-
-        ex_iterable = RebatchedArrowExamplesIterable(None, None)
-        ex_iterable = TimedExamplesIterable(ex_iterable)
-        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ex_iterable)
-        assert isinstance(ex_iterable.ex_iterable, FastRebatchedArrowExamplesIterable)
-
-    @pytest.mark.parametrize("drop_last_batch", [True, False])
-    def test_iter_arrow(self, ex_iterable: _BaseExamplesIterable, drop_last_batch: bool) -> None:
-        print(ex_iterable.iter_arrow)
-
-        ex_iterable = FastRebatchedArrowExamplesIterable(
-            ex_iterable, batch_size=8, drop_last_batch=drop_last_batch
-        )
-
-        pa_tables = [pa_table for _, pa_table in ex_iterable.iter_arrow()]
-
-        assert pa_tables[0].num_rows == 8
-        assert pa_tables[1].num_rows == 8
-
-        if drop_last_batch:
-            assert len(pa_tables) == 2
-        else:
-            assert len(pa_tables) == 3
-            assert pa_tables[2].num_rows == 4
 
 
 class TestQueueExamplesIterableShutdown:
