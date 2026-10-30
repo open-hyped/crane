@@ -41,7 +41,6 @@ from datasets.iterable_dataset import (
 from ..callbacks.base import CallbackManager
 from ..iterables import (
     ExamplesIterablePipeline,
-    FastRebatchedArrowExamplesIterable,
     QueueExamplesIterable,
     StoppableExamplesIterable,
     TimedExamplesIterable,
@@ -760,13 +759,6 @@ class Worker(mp.Process):
                         )
                         work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
 
-                        # replace all rebatch operations with fast rebatch
-                        # this especially replaces the rebatch operation that was added
-                        # by the .map call earlier
-                        work_iterator = FastRebatchedArrowExamplesIterable.replace_rebatch(
-                            work_iterator
-                        )
-
                         # prepare the iterator for iteration
                         work_iterator._init_state_dict()
                         # create the python iterable that executes the workload
@@ -1304,10 +1296,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
             A tuple containing the source dataset and a processor function representing the lazy
             operations applied to the dataset.
         """
-        # get the examples iterable from the dataset and replace all rebatch operations
-        # with fast rebatch, we do this once at the beginning to make sure the transform
-        # also contains only fast rebatch operations
-        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ds._ex_iterable)
+        ex_iterable = ds._ex_iterable
 
         # TODO: rethink which ex_iterable items to include
         #       maybe just all of them, i.e. all those that have the ex_iterable attribute
@@ -1334,9 +1323,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         ds = IterableDataset(
             ex_iterable=ex_iterable, formatting=FormattingConfig(format_type="arrow")
         )
-        # replace rebatch operations with fast rebatch
         ex_iterable = ds._prepare_ex_iterable_for_iteration(batch_size=self._prefetch)
-        ex_iterable = FastRebatchedArrowExamplesIterable.replace_rebatch(ex_iterable)
         return ex_iterable, transform
 
     def _handle_message_loop(

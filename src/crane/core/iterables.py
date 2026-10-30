@@ -2,19 +2,13 @@
 from __future__ import annotations
 
 import warnings
-from collections import deque
 from copy import copy
 from queue import Empty, Queue
 from typing import Any, Iterable
 
 import pyarrow as pa
 from datasets.formatting import PythonFormatter
-from datasets.iterable_dataset import (
-    Key,
-    RebatchedArrowExamplesIterable,
-    _BaseExamplesIterable,
-    _convert_to_arrow,
-)
+from datasets.iterable_dataset import Key, _BaseExamplesIterable
 
 from .utils import EMA, clock
 
@@ -405,132 +399,6 @@ class QueueExamplesIterable(BaseExamplesIterable):
         """
         self._state_dict = {}
         return self._state_dict
-
-
-class FastRebatchedArrowExamplesIterable(RebatchedArrowExamplesIterable):
-    """An optimized iterable for rebatching Arrow tables.
-
-    This class extends :class:`RebatchedArrowExamplesIterable` to efficiently handle
-    Arrow table rebatching, including combining smaller chunks into batches of
-    a specified size.
-    """
-
-    @classmethod
-    def replace_rebatch(cls, ex_iterable: _BaseExamplesIterable) -> _BaseExamplesIterable:
-        """Replace the rebatching operation in an examples iterable.
-
-        This method recursively replaces instances of :class:`RebatchedArrowExamplesIterable`
-        within an iterable with :class:`FastRebatchedArrowExamplesIterable`, retaining the
-        configuration (e.g., batch size, drop_last_batch).
-
-        Args:
-            ex_iterable (_BaseExamplesIterable): The examples iterable to modify.
-
-        Returns:
-            _BaseExamplesIterable: The modified examples iterable with replaced rebatching.
-        """
-        if isinstance(ex_iterable, RebatchedArrowExamplesIterable):
-            return cls(
-                ex_iterable=ex_iterable.ex_iterable,
-                batch_size=ex_iterable.batch_size,
-                drop_last_batch=ex_iterable.drop_last_batch,
-            )
-
-        if hasattr(ex_iterable, "ex_iterable"):
-            ex_iterable.ex_iterable = cls.replace_rebatch(ex_iterable.ex_iterable)
-
-        return ex_iterable
-
-    def rebatch_arrow(self, it: Iterable[tuple[Key, pa.Table]]) -> Iterable[tuple[Key, pa.Table]]:
-        """Rebatch Arrow tables into sub-tables of the specified batch size.
-
-        If the :code:`batch_size` is not set or is less than or equal to zero, this method
-        concatenates all Arrow tables and yields them as a single batch. Otherwise,
-        it processes the tables to yield batches of the specified size. Remaining
-        smaller chunks are buffered and combined as subsequent data becomes available.
-        The rows are yielded in the order they arrive in.
-
-        Args:
-            it (Iterable[tuple[Key, pa.Table]]): An iterable of Arrow tables with keys.
-
-        Yields:
-            tuple[Key, pa.Table]: A tuple containing the key and the rebatched Arrow table.
-        """
-        # return full arrow table containing the whole dataset
-        # mirrors the behavior implemented in _convert_to_arrow
-        if (self.batch_size is None) or (self.batch_size <= 0):
-            yield ("all", pa.concat_tables([pa_table for _, pa_table in it]))
-            return
-
-        # the chunks not yet yielded, in the order they arrived, and their number of rows
-        keys_buffer: deque[Key] = deque()
-        chunks_buffer: deque[pa.RecordBatch] = deque()
-        buffered = 0
-
-        for key, pa_table in it:
-            for i, chunk in enumerate(pa_table.to_reader(max_chunksize=self.batch_size)):
-                if len(chunk) == 0:
-                    continue
-                # a chunk of exactly the batch size is yielded as it is, but only when nothing
-                # is buffered before it: the rows must leave in the order they came in
-                if buffered == 0 and len(chunk) == self.batch_size:
-                    yield f"{key}_{i}", pa.Table.from_batches([chunk])
-                    continue
-
-                keys_buffer.append(f"{key}_{i}")
-                chunks_buffer.append(chunk)
-                buffered += len(chunk)
-
-                # buffer contains enough samples to build batches
-                while buffered >= self.batch_size:
-                    collected_keys_buffer = []
-                    collected_chunks_buffer = []
-                    size = 0
-                    # collect chunks from the front that make up a batch
-                    while size < self.batch_size:
-                        chunk = chunks_buffer.popleft()
-                        chunk_key = keys_buffer.popleft()
-                        take = min(len(chunk), self.batch_size - size)
-                        if take < len(chunk):
-                            # the rest of a chunk cut to fill the batch stays first in line
-                            chunks_buffer.appendleft(chunk.slice(take))
-                            keys_buffer.appendleft(chunk_key)
-                            chunk = chunk.slice(0, take)
-                        collected_keys_buffer.append(chunk_key)
-                        collected_chunks_buffer.append(chunk)
-                        size += take
-
-                    buffered -= self.batch_size
-                    yield "_".join(collected_keys_buffer), pa.Table.from_batches(
-                        collected_chunks_buffer
-                    )
-
-        if buffered > 0 and not self.drop_last_batch:
-            yield "_".join(keys_buffer), pa.Table.from_batches(list(chunks_buffer))
-
-    def _iter_arrow(self) -> Iterable[tuple[Key, pa.Table]]:
-        """Iterate over Arrow tables, rebatching them as per the configured batch size.
-
-        If :code:`batch_size` is set, the data is iterated and rebatched into sub-tables of
-        the specified size. Otherwise, the entire dataset is processed as a single batch.
-
-        Yields:
-            tuple[Key, pa.Table]: A tuple containing the key and the Arrow table.
-        """
-        # recover state if present
-        if self._state_dict and self._state_dict["previous_state"]:
-            self.ex_iterable.load_state_dict(self._state_dict["previous_state"])
-        # create the iterator over pyarrow tables
-        it = (
-            self.rebatch_arrow(self.ex_iterable.iter_arrow())
-            if self.ex_iterable.iter_arrow is not None
-            else _convert_to_arrow(
-                self.ex_iterable, batch_size=self.batch_size, drop_last_batch=self.drop_last_batch
-            )
-        )
-
-        # TODO: manage state
-        yield from it
 
 
 class ExamplesIterablePipeline(list[_BaseExamplesIterable]):

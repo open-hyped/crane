@@ -14,7 +14,7 @@ from typing import Any, Callable, TypeAlias
 from datasets.iterable_dataset import FormattingConfig, IterableDataset
 
 from ..callbacks.base import CallbackManager
-from ..iterables import FastRebatchedArrowExamplesIterable, TimedExamplesIterable
+from ..iterables import TimedExamplesIterable
 from ..monitor import ProgressMonitor, ProgressReport
 from ..utils import clock
 from ..worker import reset_worker_info, set_worker_info
@@ -155,11 +155,6 @@ class MainProcessRunner(BaseRunner):
                         ._ex_iterable
                     )
                     work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
-
-                    # replace rebatch operations with fast rebatch
-                    work_iterator = FastRebatchedArrowExamplesIterable.replace_rebatch(
-                        work_iterator
-                    )
 
                     # create the python iterable that executes the workload
                     # dynamically use the pyarrow iterable to avoid unnecessary conversion
