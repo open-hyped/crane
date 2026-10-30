@@ -45,6 +45,7 @@ from ..iterables import (
     QueueExamplesIterable,
     StoppableExamplesIterable,
     TimedExamplesIterable,
+    shards_to_read,
 )
 from ..monitor import ProgressMonitor, ProgressReport
 from ..utils import clock
@@ -1612,7 +1613,7 @@ class DynamicMultiprocessingRunner(BaseRunner):
         self._logger.info("Starting data processing.")
         self._failures = []
 
-        num_shards = ds.n_shards
+        num_shards = shards_to_read(ds._ex_iterable)
         # prepare the dataset
         src_ds, transform = self._prepare_dataset(ds)
         self._logger.info(f"Dataset prepared with {num_shards} shards.")
