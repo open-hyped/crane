@@ -12,6 +12,8 @@ class TestDatasetConsumer(unittest.TestCase):
     def test_consume_single_process(self, mock_dynamic_runner, mock_main_runner):
         # Create a mock dataset
         mock_dataset = MagicMock(spec=IterableDataset)
+        # no steps, so none given indices
+        mock_dataset._ex_iterable = None
 
         # create mock finalizer setup
         mock_finalizer = MagicMock()
@@ -60,6 +62,8 @@ class TestDatasetConsumer(unittest.TestCase):
     def test_consume_multi_process(self, mock_dynamic_runner, mock_main_runner):
         # Create a mock dataset
         mock_dataset = MagicMock(spec=IterableDataset)
+        # no steps, so none given indices
+        mock_dataset._ex_iterable = None
 
         # create mock finalizer setup
         mock_finalizer = MagicMock()

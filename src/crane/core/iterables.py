@@ -1,6 +1,7 @@
 """Custon ExampleIterable Implementations to control and monitor data flow."""
 from __future__ import annotations
 
+import logging
 import warnings
 from copy import copy
 from queue import Empty, Queue
@@ -8,9 +9,16 @@ from typing import Any, Iterable
 
 import pyarrow as pa
 from datasets.formatting import PythonFormatter
-from datasets.iterable_dataset import Key, _BaseExamplesIterable
+from datasets.iterable_dataset import (
+    FilteredExamplesIterable,
+    Key,
+    MappedExamplesIterable,
+    _BaseExamplesIterable,
+)
 
 from .utils import EMA, clock
+
+logger = logging.getLogger(__name__)
 
 
 class BaseExamplesIterable(_BaseExamplesIterable):
@@ -399,6 +407,100 @@ class QueueExamplesIterable(BaseExamplesIterable):
         """
         self._state_dict = {}
         return self._state_dict
+
+
+class ExampleIndices:
+    """The indices a worker's :func:`map` and :func:`filter` steps have counted.
+
+    They are carried over to the next stream the worker processes. A function given indices
+    (:code:`with_indices=True`) gets the position of each sample among those its worker has
+    processed: counted from 0, and on across every shard and role the worker takes, as for a
+    worker of a PyTorch :code:`DataLoader`. With a single worker, these are the positions in the
+    dataset, as in one pass over it; with several, they are not.
+
+    A runner builds a fresh copy of the steps for every stream, and a step counts from the index
+    in its state, so :func:`resume` sets each step's index to where the previous copy stopped and
+    :func:`pause` reads it back. Steps are matched by their position from the end of the chain,
+    the last step first, which is the same whether the chain reads a shard or a queue.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the indices of a worker that has processed nothing yet."""
+        self._indices: list[int] = []
+
+    @staticmethod
+    def steps(ex_iterable: _BaseExamplesIterable) -> list[MappedExamplesIterable]:
+        """The :func:`map` and :func:`filter` steps of a chain, the last step first.
+
+        Args:
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the chain.
+
+        Returns:
+            list[MappedExamplesIterable]: The steps, a :func:`filter` being a
+            :class:`MappedExamplesIterable` too.
+        """
+        steps = []
+        while ex_iterable is not None:
+            if isinstance(ex_iterable, MappedExamplesIterable):
+                steps.append(ex_iterable)
+            ex_iterable = getattr(ex_iterable, "ex_iterable", None)
+        return steps
+
+    def resume(self, ex_iterable: _BaseExamplesIterable) -> None:
+        """Let the steps of a chain count on from where the previous chain stopped.
+
+        Args:
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the chain, its
+                state initialized with :code:`_init_state_dict`.
+        """
+        # not strict: a chain may have more steps than the last, or fewer
+        for step, index in zip(self.steps(ex_iterable), self._indices, strict=False):
+            step._state_dict["previous_state_example_idx"] = index
+
+    def pause(self, ex_iterable: _BaseExamplesIterable) -> None:
+        """Keep the index each step of a chain has counted to, for the next chain.
+
+        Args:
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the chain, done
+                or stopped.
+        """
+        indices = [
+            step._state_dict["previous_state_example_idx"] for step in self.steps(ex_iterable)
+        ]
+        # a chain with fewer steps, like one reading a queue rather than a shard, keeps the
+        # indices of the steps it lacks
+        self._indices[: len(indices)] = indices
+
+    @classmethod
+    def warn(cls, ex_iterable: _BaseExamplesIterable, num_proc: int) -> None:
+        """Log a warning where the indices a function is given are not the positions.
+
+        That is, not the positions of the samples in the dataset: when several workers count
+        them, and after a :func:`filter`.
+
+        Args:
+            ex_iterable (_BaseExamplesIterable): The last examples iterable of the dataset.
+            num_proc (int): The number of processes the dataset is processed by.
+        """
+        filtered = after_filter = indexed = False
+        # from the source on, so that a step is known to come after a filter
+        for step in reversed(cls.steps(ex_iterable)):
+            if step.with_indices:
+                indexed = True
+                after_filter = after_filter or filtered
+            filtered = filtered or isinstance(step, FilteredExamplesIterable)
+
+        if indexed and num_proc > 1:
+            logger.warning(
+                f"A function is given indices (with_indices=True) and {num_proc} processes "
+                "process the dataset: each worker counts the samples it processes from 0, so "
+                "the indices are not the positions in the dataset. Use num_proc=1 for those."
+            )
+        if after_filter:
+            logger.warning(
+                "A function is given indices (with_indices=True) after a filter: they count the "
+                "samples the filter kept, not the positions in the dataset before it."
+            )
 
 
 class ExamplesIterablePipeline(list[_BaseExamplesIterable]):

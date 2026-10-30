@@ -14,6 +14,7 @@ from datasets.iterable_dataset import IterableDataset, identity_func
 
 from .callbacks.base import Callback, CallbackManager
 from .callbacks.tqdm_reporter import TqdmReporterCallback
+from .iterables import ExampleIndices
 from .runners.base import BaseRunner, FailurePolicy
 from .runners.main_process_runner import MainProcessRunner
 from .runners.multi_process_runner import DynamicMultiprocessingRunner
@@ -94,6 +95,7 @@ class DatasetConsumer(object):
                 to the finalizer function.
         """
         runner: BaseRunner
+        ExampleIndices.warn(ds._ex_iterable, self._num_proc)
 
         if self._num_proc > 1:
             logger.info("Running in multi-process mode.")

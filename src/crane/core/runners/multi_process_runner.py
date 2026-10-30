@@ -40,6 +40,7 @@ from datasets.iterable_dataset import (
 
 from ..callbacks.base import CallbackManager
 from ..iterables import (
+    ExampleIndices,
     ExamplesIterablePipeline,
     QueueExamplesIterable,
     StoppableExamplesIterable,
@@ -714,6 +715,8 @@ class Worker(mp.Process):
             # Build the role contexts before announcing readiness: under `spawn` this is
             # where the setup blob is unpickled, and it must happen in the child.
             self._build_contexts()
+            # the indices the worker's steps have counted, by the steps they belong to
+            self._indices: dict[int, ExampleIndices] = {}
             # initialize worker
             self._worker_init()
             self._send_msg(MessageType.READY)
@@ -761,6 +764,12 @@ class Worker(mp.Process):
 
                         # prepare the iterator for iteration
                         work_iterator._init_state_dict()
+                        # the standalone and consumer roles run the same steps and so share
+                        # their indices; the producer's steps are its own
+                        indices = self._indices.setdefault(
+                            id(self._active_ctx.transform), ExampleIndices()
+                        )
+                        indices.resume(work_iterator)
                         # create the python iterable that executes the workload
                         # dynamically use the pyarrow iterable to avoid unnecessary conversion
                         iter_arrow = (self._active_ctx.finalizer_formatting is not None) and (
@@ -819,6 +828,7 @@ class Worker(mp.Process):
                                         MessageType.CTX_SWITCH,
                                         payload=(previous_role.value, command.role.value),
                                     )
+                                    indices.pause(work_iterator)
                                     self._accept(command, busy=True)
                                     # recreate the work iterable
                                     break
@@ -835,6 +845,7 @@ class Worker(mp.Process):
                         else:
                             # producer exhausted
                             stream_exhausted = True
+                            indices.pause(work_iterator)
                             self._logger.info("Finished processing current context.")
                             # send final progress update and completion message
                             _report_progress(clock(), num_samples, last_report)

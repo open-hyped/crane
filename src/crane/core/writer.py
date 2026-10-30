@@ -113,7 +113,11 @@ class BaseDatasetWriter(ABC):
             overwrite (bool): Whether to overwrite existing files in the save directory.
                 Defaults to False.
             num_proc (int): Number of processes to use for dataset processing. Defaults
-                to the number of CPU cores.
+                to the number of CPU cores. A function given indices (:code:`with_indices=True`)
+                gets those its worker counts: from 0, on across every shard the worker
+                processes, as for a worker of a PyTorch :code:`DataLoader`. With
+                :code:`num_proc=1` they are the positions in the dataset; with more, they are
+                not, and a warning is logged.
             prefetch_factor (int): Number of samples to prefetch for improved
                 performance. Defaults to 8.
             write_batch_size (int): The number of samples handed to the writer in one call,
@@ -220,14 +224,34 @@ class BaseDatasetWriter(ABC):
         worker.ctx.write_fn = write_fn
         return sum(write_fn(full) for full in worker.ctx.buffer.add(batch))
 
-    def _write_info(self, ds: datasets.IterableDataset) -> None:
+    def _write_info(
+        self, ds: datasets.IterableDataset, shard_lengths: None | list[int] = None
+    ) -> None:
         """Write dataset information to a JSON file in the save directory.
+
+        With :code:`shard_lengths`, the split written is recorded in the info's :code:`splits`:
+        its number of samples, and those of each shard in the order of their files, as
+        :code:`shard_lengths`. Any splits the info had before, of the dataset the samples were
+        read from, are replaced.
 
         Args:
             ds (datasets.IterableDataset): The dataset object containing metadata to be saved.
+            shard_lengths (None | list[int]): The number of samples of each shard written.
         """
         logger.info(f"Writing dataset info to {os.getcwd()}.")
-        ds.info.write_to_directory(".", pretty_print=True)
+        info = ds.info.copy()
+        if shard_lengths is not None:
+            split = str(ds.split) if ds.split is not None else str(datasets.Split.TRAIN)
+            info.splits = datasets.SplitDict(
+                {
+                    split: datasets.SplitInfo(
+                        name=split,
+                        num_examples=sum(shard_lengths),
+                        shard_lengths=shard_lengths,
+                    )
+                }
+            )
+        info.write_to_directory(".", pretty_print=True)
 
     def _write_state(self, ds: datasets.IterableDataset) -> None:
         """Write the state of the dataset to a JSON file in the save directory.
@@ -375,7 +399,7 @@ class BaseDatasetWriter(ABC):
 
             # write dataset info and state
             self._write_state(ds)
-            self._write_info(ds)
+            self._write_info(ds, sharding_controller.shard_lengths)
             # give the writer a look at the finished dataset as a whole
             self.finalize_dataset(ds)
 
@@ -398,6 +422,9 @@ class BaseDatasetWriter(ABC):
 
     def write(self, ds: DatasetType) -> None:
         """Write the entire dataset or dataset dictionary to disk.
+
+        The dataset info written beside the shards records each split's number of samples, and
+        those of each shard in the order of their files, as :code:`shard_lengths`.
 
         Args:
             ds (DatasetType): The dataset or dataset dictionary to be written.

@@ -143,6 +143,12 @@ Crucially, the split between producers and consumers is **not fixed**. `crane` a
 
 A **balancer** continuously watches the queue's fill level and the time producers and consumers spend blocked, and shifts workers between the two roles to keep the two sides matched, searching for the sweet spot where neither side is left waiting and total throughput is maximized.
 
+### Indices
+
+A function given indices (`with_indices=True` in `map` or `filter`) gets those its **worker** counts: from 0, on across every shard and role the worker takes, as for a worker of a PyTorch `DataLoader`. With `num_proc=1` these are the positions in the dataset, as in one pass over it; with more, they are not. After a `filter`, as in `datasets`, they count the samples the filter kept. `crane` logs a warning in both cases.
+
+The written `dataset_info.json` records the number of samples of each shard as the split's `shard_lengths`.
+
 ## Contributions
 
 Contributions are welcome! Feel free to submit a pull request or open an issue to discuss your ideas.

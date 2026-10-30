@@ -108,6 +108,7 @@ class TestBaseDatasetWriter:
             patch("crane.core.writer.ShardingController") as sharding_mock,
         ):
             sharding_mock().is_active = with_sharding
+            sharding_mock().shard_lengths = [1]
             sharding_mock.reset_mock()
 
             writer = MockDatasetWriter(

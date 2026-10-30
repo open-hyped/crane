@@ -182,12 +182,14 @@ class _OpenShard:
         shard_id (None | int): The id of the open shard, or None when none is open.
         size (int): The size of the shard in the unit of the sharding strategy.
         num_bytes (int): The number of bytes written to the shard.
+        num_rows (int): The number of samples handed to the shard, whatever the strategy.
         batch_size (int): The size of the batch that is currently being written.
     """
 
     shard_id: None | int = None
     size: int = 0
     num_bytes: int = 0
+    num_rows: int = 0
     batch_size: int = 0
 
 
@@ -276,13 +278,16 @@ class ShardingController(object):
         self._batch_size_fn = GET_BATCH_SIZE_FN_MAPPING.get(
             (formatting, sharding_strategy), _no_batch_size
         )
-        # global shard state
+        self._num_rows_fn = GET_BATCH_SIZE_FN_MAPPING[(formatting, ShardingStrategy.SAMPLE_COUNT)]
+        # global shard state: the shards opened, and the samples of each closed one by its id
         if is_multi_processed:
             manager = mp.Manager()
             self._num_shards = manager.Value("i32", 0)
+            self._shard_lengths = manager.dict()
             self._lock = manager.Lock()
         else:
             self._num_shards = 0
+            self._shard_lengths = {}
             self._lock = None
         # shard creation
         self._initialize_shard = initialize_shard
@@ -296,6 +301,19 @@ class ShardingController(object):
             bool: True if sharding is active, False otherwise.
         """
         return self._sharding_strategy is not ShardingStrategy.NONE
+
+    @property
+    def shard_lengths(self) -> list[int]:
+        """The number of samples of each shard, in the order of their ids.
+
+        Counted as the samples are handed to a shard, in every process, and kept when the
+        shard is closed: complete once every shard is.
+
+        Returns:
+            list[int]: The samples of each shard.
+        """
+        num_shards = self._num_shards.get() if self._is_multi_processed else self._num_shards
+        return [self._shard_lengths[shard_id] for shard_id in range(num_shards)]
 
     @property
     def _shard(self) -> _OpenShard:
@@ -355,6 +373,9 @@ class ShardingController(object):
             self.finalize()
             self.initialize()
 
+        # the samples go to the shard open now: those the writer still buffers are flushed into
+        # it when it closes
+        self._shard.num_rows += self._num_rows_fn(batch, self._sample_size_key)
         return batch
 
     def update(self, num_bytes: int) -> None:
@@ -390,5 +411,6 @@ class ShardingController(object):
         """Finalize the current shard, reset its state, and invoke the finalization logic."""
         if self._shard.shard_id is not None:
             self._finalize_shard()
+            self._shard_lengths[self._shard.shard_id] = self._shard.num_rows
             logger.info(f"Finalized shard with id {self._shard.shard_id}")
             self._reset_state()

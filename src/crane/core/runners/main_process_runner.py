@@ -14,7 +14,7 @@ from typing import Any, Callable, TypeAlias
 from datasets.iterable_dataset import FormattingConfig, IterableDataset
 
 from ..callbacks.base import CallbackManager
-from ..iterables import TimedExamplesIterable
+from ..iterables import ExampleIndices, TimedExamplesIterable
 from ..monitor import ProgressMonitor, ProgressReport
 from ..utils import clock
 from ..worker import reset_worker_info, set_worker_info
@@ -127,6 +127,9 @@ class MainProcessRunner(BaseRunner):
 
             last_report = clock()
 
+            # one worker: the indices count on from one shard to the next, as in one pass
+            indices = ExampleIndices()
+
             for shard_id in range(num_shards):
                 try:
                     monitor._mark_shard_in_progress(0, shard_id)
@@ -155,6 +158,8 @@ class MainProcessRunner(BaseRunner):
                         ._ex_iterable
                     )
                     work_iterator = TimedExamplesIterable(work_iterator, smoothing=0.1)
+                    work_iterator._init_state_dict()
+                    indices.resume(work_iterator)
 
                     # create the python iterable that executes the workload
                     # dynamically use the pyarrow iterable to avoid unnecessary conversion
@@ -186,6 +191,7 @@ class MainProcessRunner(BaseRunner):
                             # reset
                             num_samples, last_report = 0, now
 
+                    indices.pause(work_iterator)
                     logger.info(f"Finished processing shard {shard_id}.")
                     monitor._mark_worker_completed(0)
 
