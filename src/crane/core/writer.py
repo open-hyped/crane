@@ -225,23 +225,28 @@ class BaseDatasetWriter(ABC):
         return sum(write_fn(full) for full in worker.ctx.buffer.add(batch))
 
     def _write_info(
-        self, ds: datasets.IterableDataset, shard_lengths: None | list[int] = None
+        self,
+        ds: datasets.IterableDataset,
+        shard_lengths: None | list[int] = None,
+        split: None | str = None,
     ) -> None:
         """Write dataset information to a JSON file in the save directory.
 
         With :code:`shard_lengths`, the split written is recorded in the info's :code:`splits`:
         its number of samples, and those of each shard in the order of their files, as
         :code:`shard_lengths`. Any splits the info had before, of the dataset the samples were
-        read from, are replaced.
+        read from, are replaced. The split is named :code:`split`, else the dataset's own, else
+        :code:`train`, as :func:`datasets.load_dataset` names the split of the files read back.
 
         Args:
             ds (datasets.IterableDataset): The dataset object containing metadata to be saved.
             shard_lengths (None | list[int]): The number of samples of each shard written.
+            split (None | str): The name of the split written.
         """
         logger.info(f"Writing dataset info to {os.getcwd()}.")
         info = ds.info.copy()
         if shard_lengths is not None:
-            split = str(ds.split) if ds.split is not None else str(datasets.Split.TRAIN)
+            split = split or (str(ds.split) if ds.split is not None else str(datasets.Split.TRAIN))
             info.splits = datasets.SplitDict(
                 {
                     split: datasets.SplitInfo(
@@ -326,7 +331,10 @@ class BaseDatasetWriter(ABC):
         return formatting, write_fn.__get__(self, type(self))
 
     def _write_dataset(
-        self, ds: datasets.IterableDataset | datasets.Dataset, save_dir: str
+        self,
+        ds: datasets.IterableDataset | datasets.Dataset,
+        save_dir: str,
+        split: None | str = None,
     ) -> None:
         """Write the single dataset split to the specified directory.
 
@@ -334,6 +342,9 @@ class BaseDatasetWriter(ABC):
             ds (datasets.IterableDataset | datasets.Dataset): The dataset or iterable dataset to be
                 written.
             save_dir (str): The directory where the split data will be saved.
+            split (None | str): The name of the split, as the dataset dictionary has it; the
+                dataset's own if None, which a :class:`datasets.Dataset` loses as it is made
+                iterable.
         """
         if ds.info is None:
             warnings.warn(
@@ -399,7 +410,7 @@ class BaseDatasetWriter(ABC):
 
             # write dataset info and state
             self._write_state(ds)
-            self._write_info(ds, sharding_controller.shard_lengths)
+            self._write_info(ds, sharding_controller.shard_lengths, split)
             # give the writer a look at the finished dataset as a whole
             self.finalize_dataset(ds)
 
@@ -447,7 +458,7 @@ class BaseDatasetWriter(ABC):
         if isinstance(ds, (datasets.DatasetDict, datasets.IterableDatasetDict)):
             # write all splits
             for key, split in ds.items():
-                self._write_dataset(split, os.path.join(self.save_dir, key))
+                self._write_dataset(split, os.path.join(self.save_dir, key), key)
             # write dataset splits json
             with open(
                 os.path.join(self.save_dir, datasets.config.DATASETDICT_JSON_FILENAME), "w+"

@@ -86,3 +86,57 @@ def test_the_info_replaces_the_splits_of_the_source(tmp_path):
             "dataset_name": None,
         }
     }
+
+
+def _split(save_dir: str) -> dict[str, tuple[int, list[int]]]:
+    """The splits the info in `save_dir` records: each one's samples and shard lengths."""
+    splits = datasets.DatasetInfo.from_directory(save_dir).splits
+    return {name: (split.num_examples, split.shard_lengths) for name, split in splits.items()}
+
+
+WRITER_ARGS = {
+    "num_proc": 1,
+    "sharding_strategy": ShardingStrategy.SAMPLE_COUNT,
+    "max_shard_size": 40,
+    "write_batch_size": 10,
+    "prefetch_factor": 10,
+    "disable_tqdm": True,
+}
+
+
+def test_a_dataset_without_a_split_is_recorded_as_train(tmp_path):
+    # as `datasets.load_dataset` names the split of the files read back
+    ds = IterableDataset(ArrowExamplesIterable(_tables, {"sizes": (60, 40)}))
+    assert ds.split is None
+    save_dir = os.path.join(tmp_path, "data")
+
+    JsonDatasetWriter(save_dir, **WRITER_ARGS).write(ds)
+
+    assert _split(save_dir) == {"train": (100, [40, 50, 10])}
+
+
+def test_a_split_is_recorded_by_its_name(tmp_path):
+    ds = IterableDataset(
+        ArrowExamplesIterable(_tables, {"sizes": (30,)}), split=datasets.Split.TEST
+    )
+    save_dir = os.path.join(tmp_path, "data")
+
+    JsonDatasetWriter(save_dir, **WRITER_ARGS).write(ds)
+
+    assert _split(save_dir) == {"test": (30, [30])}
+
+
+def test_each_split_of_a_dict_is_recorded_by_its_key(tmp_path):
+    # made iterable, a `Dataset` loses its split: the key of the dictionary names it
+    ds = datasets.DatasetDict(
+        {
+            "train": datasets.Dataset.from_dict({"id": list(range(100))}),
+            "test": datasets.Dataset.from_dict({"id": list(range(30))}),
+        }
+    )
+    save_dir = os.path.join(tmp_path, "data")
+
+    JsonDatasetWriter(save_dir, **WRITER_ARGS).write(ds)
+
+    assert _split(os.path.join(save_dir, "train")) == {"train": (100, [40, 50, 10])}
+    assert _split(os.path.join(save_dir, "test")) == {"test": (30, [30])}
