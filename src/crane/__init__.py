@@ -47,14 +47,22 @@ else:
     import importlib
     import sys
 
+    LAZY_MODULES = {
+        "JsonDatasetWriter": ".json",
+        "ArrowDatasetWriter": ".arrow",
+        "ParquetDatasetWriter": ".parquet",
+    }
+
     def lazy_load(name: str) -> object:
-        """Lazy loads module content based on attribute name."""
-        module = {
-            "JsonDatasetWriter": ".json",
-            "ArrowDatasetWriter": ".arrow",
-            "ParquetDatasetWriter": ".parquet",
-        }[name]
-        module = importlib.import_module(module, package=__name__)
-        return getattr(module, name)
+        """Lazy loads module content based on attribute name.
+
+        Raises `AttributeError` for any other name, as a module `__getattr__` must: `getattr`
+        with a default and `hasattr` rely on it, and so does code that probes every loaded
+        module for a name, like skops looking for scipy's ufuncs.
+        """
+        module = LAZY_MODULES.get(name)
+        if module is None:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        return getattr(importlib.import_module(module, package=__name__), name)
 
     sys.modules[__name__].__getattr__ = lazy_load
